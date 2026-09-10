@@ -20,12 +20,8 @@ from hact_relax.cases import (
     R_ANG,
     parse_cases,
     parse_fragments,
-    parse_relax_radius,
 )
-from hact_relax.driver import (
-    run_chain_length_relaxation,
-    run_one,
-)
+from hact_relax.driver import run_one
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,8 +38,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lattice-r", type=float, default=R_ANG)
     parser.add_argument("--vacuum", type=float, default=30.0)
     parser.add_argument("--seed-displace", type=float, default=0.0)
-    parser.add_argument("--relax-radius", type=parse_relax_radius,
-                        default="all", metavar="ALL|ANGSTROM")
     parser.add_argument("--coordsys", default="tric",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
 
@@ -79,28 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-unconverged-geometry", action="store_true")
     parser.add_argument("--single-point", action="store_true")
 
-    parser.add_argument("--max-chain-length-steps", type=int, default=4)
-    parser.add_argument("--chain-length-epsilon", type=float, default=0.01)
-    parser.add_argument("--chain-length-tol", type=float, default=1e-3)
-    parser.add_argument("--max-chain-length-shift", type=float, default=0.02)
-    parser.add_argument("--max-cell-continuation-halvings", type=int, default=2)
-
     parser.add_argument("--threads", type=int, default=THREADS)
     parser.add_argument("--memory-mb", type=int,
                         default=int(os.environ.get("SLURM_MEM_PER_NODE", "4000")))
     parser.add_argument("--verbose", type=int, default=4)
-
-    parser.set_defaults(
-        energy_only=False,
-        compute_core_energy=True,
-        strict_continuation=None,
-    )
     return parser
 
 
 def validate_args(parser: argparse.ArgumentParser, args):
-    if not args.frozen_embedding_outside_fragment and not args.exact_embedding:
-        args.frozen_embedding = True
     try:
         cases = parse_cases(args.cases)
         fragments = parse_fragments(args.fragments)
@@ -124,17 +104,6 @@ def validate_args(parser: argparse.ArgumentParser, args):
         parser.error("--chain-cells must be positive")
     if args.lattice_r <= 0.0:
         parser.error("--lattice-r must be positive")
-    if not args.single_point:
-        if args.max_chain_length_steps < 1:
-            parser.error("--max-chain-length-steps must be positive")
-        if args.max_cell_continuation_halvings < 0:
-            parser.error("--max-cell-continuation-halvings must be non-negative")
-        if not 0.0 < args.chain_length_epsilon < 0.5:
-            parser.error("--chain-length-epsilon must lie in (0, 0.5)")
-        if args.chain_length_tol <= 0.0:
-            parser.error("--chain-length-tol must be positive")
-        if not 0.0 < args.max_chain_length_shift < 1.0:
-            parser.error("--max-chain-length-shift must lie in (0, 1)")
     if args.xyz is not None and len(cases) * len(fragments) != 1:
         parser.error("--xyz can only describe one case/fragment combination")
     largest = max(fragments)
@@ -157,16 +126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for fragment in fragments:
         for case_name in cases:
             input_xyz = args.xyz.resolve() if args.xyz is not None else None
-            if args.single_point:
-                outputs.append(
-                    run_one(args, case_name, fragment, input_xyz).output_dir
-                )
-            else:
-                outputs.append(
-                    run_chain_length_relaxation(
-                        args, case_name, fragment, input_xyz
-                    )
-                )
+            outputs.append(run_one(args, case_name, fragment, input_xyz))
     print("# completed outputs:")
     for path in outputs:
         print("#   %s" % path)

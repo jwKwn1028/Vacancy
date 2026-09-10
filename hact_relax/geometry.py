@@ -97,12 +97,6 @@ def write_xyz(
     path.write_text("\n".join(lines) + "\n")
 
 
-def scaled_geometry(coords_bohr, epsilon, axis=0):
-    out = np.array(coords_bohr, dtype=float, copy=True)
-    out[:, int(axis)] *= 1.0 + float(epsilon)
-    return out
-
-
 def check_geometry_fits_lattice(
     coords_bohr: np.ndarray, ncells: int, r_ang: float, source: str, axis: int = 0
 ) -> float:

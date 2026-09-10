@@ -49,11 +49,7 @@ def parse_fragments(value: str) -> list[int]:
     return values
 
 
-def parse_relax_radius(value: str) -> float | None:
-    text = str(value).strip().lower()
-    if text == "all":
-        return None
-    radius = float(text)
-    if radius <= 0.0:
-        raise ValueError("--relax-radius must be positive or 'all'")
-    return radius
+def fragment_relax_radius(n_frag: int, r_ang: float = R_ANG) -> float:
+    if int(n_frag) < 1:
+        raise ValueError("n_frag must be positive")
+    return max((int(n_frag) - 1) // 2, 1) * float(r_ang)

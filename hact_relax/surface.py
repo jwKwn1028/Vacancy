@@ -71,35 +71,13 @@ class ActiveHamiltonianSurface:
         self.labels = list(labels)
         self.vacancy_index = int(vacancy_index)
         self.lattice_bohr = np.asarray(lattice_bohr, dtype=float)
-        self.cache: dict[str, tuple[float, bool]] = {}
+        self.cache: dict[str, float] = {}
         self.last_accepted_key: str | None = None
         self.pristine_reference: PristineReference | None = None
         self.active_solution_reference: ActiveSolutionReference | None = None
         self.fixed_n_bath: int | None = None
         self.fixed_fragment_atoms: tuple[int, ...] | None = None
         self.last_center_followed = False
-
-    def inherit_continuation(
-        self,
-        previous: "ActiveHamiltonianSurface",
-        *,
-        include_pristine: bool = True,
-    ) -> None:
-        if self.settings.case_name != previous.settings.case_name:
-            raise ValueError("cannot continue between different defect cases")
-        if self.settings.fragment != previous.settings.fragment:
-            raise ValueError("cannot continue between different fragment sizes")
-        if (self.labels != previous.labels
-                or self.vacancy_index != previous.vacancy_index):
-            raise ValueError("cannot continue between different atom orderings")
-
-        self.pristine_reference = (
-            previous.pristine_reference if include_pristine else None
-        )
-        self.active_solution_reference = previous.active_solution_reference
-        self.fixed_n_bath = previous.fixed_n_bath
-        self.fixed_fragment_atoms = previous.fixed_fragment_atoms
-        self.last_center_followed = previous.last_center_followed
 
     @staticmethod
     def _key(coords_bohr: np.ndarray) -> str:
@@ -233,22 +211,16 @@ class ActiveHamiltonianSurface:
         *,
         accept_center: bool = False,
         displaced_atom: int | None = None,
-        compute_core_energy: bool = True,
-        strict_continuation: bool | None = None,
     ) -> float:
         settings = self.settings
         coords_bohr = np.asarray(coords_bohr, dtype=float).reshape(-1, 3)
-        if strict_continuation is None:
-            strict_continuation = displaced_atom is not None
-        strict_continuation = bool(strict_continuation)
-        compute_core_energy = bool(compute_core_energy)
+        strict_continuation = displaced_atom is not None
 
         key = self._key(coords_bohr)
         cached = self.cache.get(key)
         if (cached is not None
-                and (not accept_center or self.last_accepted_key == key)
-                and (not compute_core_energy or cached[1])):
-            return cached[0]
+                and (not accept_center or self.last_accepted_key == key)):
+            return cached
 
         prior_pristine = self.pristine_reference
         transported = self._transport_pristine(prior_pristine, displaced_atom)
@@ -296,7 +268,6 @@ class ActiveHamiltonianSurface:
             vacancy_index=self.vacancy_index,
             fixed_n_bath=self.fixed_n_bath,
             fixed_fragment_atoms=self.fixed_fragment_atoms,
-            compute_core_energy=compute_core_energy,
             auxbasis=settings.auxbasis,
             embedding_geometry=coords_bohr if transported else None,
         )
@@ -383,18 +354,14 @@ class ActiveHamiltonianSurface:
                 "frozen-bath SCF on H_act^V did not converge", reason=reason
             )
 
-        core_energy_computed = all(
-            value is not None
+        if any(
+            value is None
             for value in (solver.E1e_core, solver.E2e_core, solver.Enuc)
-        )
-        if core_energy_computed:
-            energy = float(
-                result[1] + solver.E1e_core + solver.E2e_core + solver.Enuc
-            )
-        elif compute_core_energy:
+        ):
             raise RuntimeError("the full H_act^V objective requires core energies")
-        else:
-            energy = float(result[1])
+        energy = float(
+            result[1] + solver.E1e_core + solver.E2e_core + solver.Enuc
+        )
 
         if accept_center:
             self.pristine_reference = next_pristine_reference
@@ -412,7 +379,7 @@ class ActiveHamiltonianSurface:
             self.cache.clear()
             self.last_accepted_key = key
 
-        self.cache[key] = (energy, core_energy_computed)
+        self.cache[key] = energy
         print("# %-26s E=% .12f Ha" % (reason, energy), flush=True)
         gc.collect()
         return energy

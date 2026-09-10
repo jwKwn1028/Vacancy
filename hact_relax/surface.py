@@ -48,8 +48,6 @@ class SurfaceSettings:
     min_subspace_overlap: float
     min_center_subspace_overlap: float
     verbose: int
-    frozen_embedding: bool = False
-    frozen_embedding_outside_fragment: bool = False
     auxbasis: str | None = None
     follow_negative_mode: bool = False
     follow_mode_tol: float = 1e-8
@@ -191,19 +189,6 @@ class ActiveHamiltonianSurface:
             return result, False
         return self._apply_orbital_rotation(result, kappa, after), True
 
-    def _transport_pristine(self, prior_pristine, displaced_atom) -> bool:
-        if prior_pristine is None or prior_pristine.kmf is None:
-            return False
-        if self.settings.frozen_embedding:
-            return True
-        if not self.settings.frozen_embedding_outside_fragment:
-            return False
-        if displaced_atom is None:
-            return False
-        if self.fixed_fragment_atoms is None:
-            return False
-        return int(displaced_atom) not in self.fixed_fragment_atoms
-
     def energy(
         self,
         coords_bohr: np.ndarray,
@@ -232,36 +217,31 @@ class ActiveHamiltonianSurface:
             return cached
 
         prior_pristine = self.pristine_reference
-        transported = self._transport_pristine(prior_pristine, displaced_atom)
-        if transported:
-            pristine_kmf = prior_pristine.kmf
-            next_pristine_reference = prior_pristine
-        else:
-            _, pristine_kmf = build_pristine_mean_field(
-                restored_pristine_atoms(self.labels, coords_bohr),
-                self.lattice_bohr,
-                settings.basis,
-                kmesh=settings.reference_kmesh,
-                pseudo=None,
-                charge=0,
-                spin=0,
-                exxdiv=None,
-                verbose=settings.verbose,
-                max_memory=settings.memory_mb,
-                conv_tol=settings.scf_conv_tol,
-                conv_tol_grad=settings.scf_conv_tol_grad,
-                max_cycle=settings.scf_max_cycle,
-                auxbasis=settings.auxbasis,
-                dm0=None if prior_pristine is None else prior_pristine.density,
-            )
-            occupied_match = align_pristine_occupied_subspace(
-                pristine_kmf, prior_pristine
-            )
-            self._guard_pristine_overlap(
-                None if occupied_match is None else occupied_match.fidelity,
-                strict_continuation=strict_continuation,
-            )
-            next_pristine_reference = make_pristine_reference(pristine_kmf)
+        _, pristine_kmf = build_pristine_mean_field(
+            restored_pristine_atoms(self.labels, coords_bohr),
+            self.lattice_bohr,
+            settings.basis,
+            kmesh=settings.reference_kmesh,
+            pseudo=None,
+            charge=0,
+            spin=0,
+            exxdiv=None,
+            verbose=settings.verbose,
+            max_memory=settings.memory_mb,
+            conv_tol=settings.scf_conv_tol,
+            conv_tol_grad=settings.scf_conv_tol_grad,
+            max_cycle=settings.scf_max_cycle,
+            auxbasis=settings.auxbasis,
+            dm0=None if prior_pristine is None else prior_pristine.density,
+        )
+        occupied_match = align_pristine_occupied_subspace(
+            pristine_kmf, prior_pristine
+        )
+        self._guard_pristine_overlap(
+            None if occupied_match is None else occupied_match.fidelity,
+            strict_continuation=strict_continuation,
+        )
+        next_pristine_reference = make_pristine_reference(pristine_kmf)
 
         common = dict(
             vac_species=self.case.vacancy,
@@ -278,7 +258,6 @@ class ActiveHamiltonianSurface:
             fixed_n_bath=self.fixed_n_bath,
             fixed_fragment_atoms=self.fixed_fragment_atoms,
             auxbasis=settings.auxbasis,
-            embedding_geometry=coords_bohr if transported else None,
         )
         if self.case.spin == 0:
             solver = SchmidtEmbeddedRHF(

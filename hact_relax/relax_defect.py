@@ -41,12 +41,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--coordsys", default="cart",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
 
-    reference_policy = parser.add_mutually_exclusive_group()
-    reference_policy.add_argument("--frozen-embedding", action="store_true")
-    reference_policy.add_argument("--frozen-embedding-outside-fragment",
-                                  action="store_true")
-    reference_policy.add_argument("--exact-embedding", action="store_true")
-
     parser.add_argument("--bath-tol", type=float, default=1e-6)
     parser.add_argument("--scf-max-cycle", type=int, default=200)
     parser.add_argument("--scf-conv-tol", type=float, default=1e-9)

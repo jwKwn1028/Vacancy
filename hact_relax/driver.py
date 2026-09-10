@@ -10,7 +10,7 @@ import numpy as np
 from pyscf.geomopt import geometric_solver
 from pyscf.geomopt.addons import as_pyscf_method
 
-from hact_relax.cases import CASES, FULL_CHAIN_KMESH, fragment_relax_radius
+from hact_relax.cases import CASES, FULL_CHAIN_KMESH
 from hact_relax.errors import GeometryOptimizationNotConverged
 from hact_relax.geometry import (
     build_driver_molecule,
@@ -97,8 +97,9 @@ def run_one(
     coords_bohr = seed_displace_from_vacancy(
         coords_bohr, vacancy_index, args.seed_displace
     )
-    relax_radius = fragment_relax_radius(fragment, args.lattice_r)
-    movable = movable_atoms(labels, coords_bohr, vacancy_index, relax_radius)
+    movable = movable_atoms(
+        labels, coords_bohr, vacancy_index, fragment, args.lattice_r
+    )
     if not movable:
         raise ValueError("no real atoms selected for relaxation")
 
@@ -122,10 +123,6 @@ def run_one(
         min_subspace_overlap=args.min_subspace_overlap,
         min_center_subspace_overlap=args.min_center_subspace_overlap,
         verbose=args.verbose,
-        frozen_embedding=bool(args.frozen_embedding),
-        frozen_embedding_outside_fragment=bool(
-            args.frozen_embedding_outside_fragment
-        ),
         follow_negative_mode=bool(args.follow_negative_mode),
         rescue_unconverged_scf=bool(args.rescue_unconverged_scf),
         rescue_tol_factor=float(args.rescue_tol_factor),

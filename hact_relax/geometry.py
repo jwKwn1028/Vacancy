@@ -9,7 +9,14 @@ import numpy as np
 from pyscf import gto
 from pyscf.geomopt import geometric_solver
 
-from hact_relax.cases import BOHR, CASES, CHAIN_CELLS, R_ANG, VacancyCase
+from hact_relax.cases import (
+    BOHR,
+    CASES,
+    CHAIN_CELLS,
+    R_ANG,
+    VacancyCase,
+    fragment_relax_radius,
+)
 from system.vacancy import get_vacancy_xyz
 
 
@@ -138,14 +145,14 @@ def movable_atoms(
     labels: Sequence[str],
     coords_bohr: np.ndarray,
     vacancy_index: int,
-    radius_ang: float | None,
+    n_frag: int,
+    r_ang: float = R_ANG,
 ) -> list[int]:
     candidates = [
         i for i, label in enumerate(labels)
         if not label.upper().startswith("GHOST")
     ]
-    if radius_ang is None:
-        return candidates
+    radius_ang = fragment_relax_radius(n_frag, r_ang)
     distance = np.linalg.norm(
         np.asarray(coords_bohr) - np.asarray(coords_bohr)[vacancy_index], axis=1
     )

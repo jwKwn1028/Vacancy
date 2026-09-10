@@ -12,7 +12,6 @@ class PristineReference:
     cell: object
     density: np.ndarray
     occupied_coeff: np.ndarray
-    kmf: object = None
 
 
 @dataclass
@@ -237,7 +236,6 @@ def make_pristine_reference(kmf) -> PristineReference:
     occ = np.asarray(kmf.mo_occ)
     occ_gamma = occ[0] if occ.ndim == 2 else occ
     return PristineReference(
-        kmf=kmf,
         cell=kmf.cell,
         density=np.asarray(kmf.make_rdm1()).copy(),
         occupied_coeff=coeff[:, occ_gamma > 0].copy(),

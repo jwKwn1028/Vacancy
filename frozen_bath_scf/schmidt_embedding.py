@@ -25,9 +25,8 @@ class _SchmidtEmbedding:
                    minao="minao", bath_tol=1e-8, max_cycle=200, level_shift=0.0,
                    verbose=0, defect=True, eri_mode="periodic",
                    seed_vacancy=False, vacancy_index=None,
-                   embedding_geometry=None, fixed_n_bath=None,
-                   fixed_fragment_atoms=None, compute_core_energy=True,
-                   auxbasis=None):
+                   fixed_n_bath=None, fixed_fragment_atoms=None,
+                   compute_core_energy=True, auxbasis=None):
         self.kmf = kmf
         self.kmesh = list(kmesh)
         self.vac_species = vac_species
@@ -42,7 +41,6 @@ class _SchmidtEmbedding:
         self.eri_mode = eri_mode
         self.seed_vacancy = seed_vacancy
         self.vacancy_index = vacancy_index
-        self.embedding_geometry = embedding_geometry
         self.fixed_n_bath = fixed_n_bath
         self.fixed_fragment_atoms = fixed_fragment_atoms
         self.compute_core_energy = bool(compute_core_energy)
@@ -69,8 +67,8 @@ class _SchmidtEmbedding:
             self.Enuc = None
         self._seed_initial_occ()
 
-    def _reusable_pristine_hcore(self, scell, gdf, *, gamma_full_cell, geometry):
-        if not gamma_full_cell or geometry is not None:
+    def _reusable_pristine_hcore(self, scell, gdf, *, gamma_full_cell):
+        if not gamma_full_cell:
             return None
 
         ecpbas = getattr(scell, "_ecpbas", ())
@@ -123,27 +121,18 @@ class _SchmidtEmbedding:
             self.kmf, kmesh=self.kmesh
         )
         scell = mf_sc.cell
-        geometry = self.embedding_geometry
-        if geometry is not None:
-            geometry = np.asarray(geometry, dtype=float).reshape(-1, 3)
-            if geometry.shape != (scell.natm, 3):
-                raise ValueError(
-                    "embedding_geometry has shape %s, expected (%d, 3) for "
-                    "kmesh=%s" % (geometry.shape, scell.natm, self.kmesh)
-                )
-            scell = scell.set_geom_(geometry, unit="Bohr", inplace=False)
         self.scell = scell
         self.vacancy = scell
         self.ncells = int(np.prod(self.kmesh))
 
-        if gamma_full_cell and geometry is None and getattr(self.kmf, "with_df", None):
+        if gamma_full_cell and getattr(self.kmf, "with_df", None):
             gdf = self.kmf.with_df
             reused = getattr(gdf, "auxbasis", None)
             if self.auxbasis is not None and reused != self.auxbasis:
                 raise ValueError(
                     "pristine KRHF was density-fitted with auxbasis=%r but the "
-                    "embedding was given auxbasis=%r; fresh and transported "
-                    "points would use different fits" % (reused, self.auxbasis)
+                    "embedding was given auxbasis=%r"
+                    % (reused, self.auxbasis)
                 )
             if getattr(gdf, "_cderi", None) is None:
                 gdf.build()
@@ -160,19 +149,10 @@ class _SchmidtEmbedding:
         self.S = np.asarray(scell.pbc_intor("int1e_ovlp", hermi=1)).real
 
         orbocc = mo[:, occ > 0]
-        if geometry is not None:
-            metric = orbocc.T @ self.S @ orbocc
-            eig, vec = np.linalg.eigh(0.5 * (metric + metric.T))
-            if eig.size and eig.min() < 1e-10:
-                raise RuntimeError(
-                    "transported pristine occupied space became linearly "
-                    "dependent: min eigenvalue %.3e" % eig.min()
-                )
-            orbocc = orbocc @ ((vec / np.sqrt(eig)) @ vec.T)
         self._orbocc = orbocc
 
         cached_hcore = self._reusable_pristine_hcore(
-            scell, gdf, gamma_full_cell=gamma_full_cell, geometry=geometry
+            scell, gdf, gamma_full_cell=gamma_full_cell
         )
         if cached_hcore is not None:
             self.hcore = np.array(cached_hcore, copy=True).real

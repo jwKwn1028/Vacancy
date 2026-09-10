@@ -139,7 +139,7 @@ class _SchmidtEmbedding:
         if gamma_full_cell and geometry is None and getattr(self.kmf, "with_df", None):
             gdf = self.kmf.with_df
             reused = getattr(gdf, "auxbasis", None)
-            if reused != self.auxbasis:
+            if self.auxbasis is not None and reused != self.auxbasis:
                 raise ValueError(
                     "pristine KRHF was density-fitted with auxbasis=%r but the "
                     "embedding was given auxbasis=%r; fresh and transported "

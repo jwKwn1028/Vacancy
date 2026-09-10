@@ -26,6 +26,7 @@ from hact_relax.geometry import (
 )
 from hact_relax.gradient import (
     FiniteDifferenceScanner,
+    SemiAnalyticGradientScanner,
     save_final_gradient,
     write_constraints,
 )
@@ -101,9 +102,10 @@ def run_one(
     if not movable:
         raise ValueError("no real atoms selected for relaxation")
 
-    output_dir = unique_output_dir(
-        args.output_dir, "%s-frag%d" % (case_name, fragment)
-    )
+    output_stem = "%s-frag%d" % (case_name, fragment)
+    if getattr(args, "semi_analytic_gradient", False):
+        output_stem += "-semi-analytic"
+    output_dir = unique_output_dir(args.output_dir, output_stem)
     output_dir.mkdir(parents=True)
 
     settings = SurfaceSettings(
@@ -145,7 +147,12 @@ def run_one(
         vacancy_index,
         full_chain_lattice(chain_cells, args.lattice_r, args.vacuum),
     )
-    scanner = FiniteDifferenceScanner(
+    scanner_type = (
+        SemiAnalyticGradientScanner
+        if getattr(args, "semi_analytic_gradient", False)
+        else FiniteDifferenceScanner
+    )
+    scanner = scanner_type(
         surface,
         movable,
         args.fd_step,

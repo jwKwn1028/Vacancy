@@ -11,6 +11,8 @@ from hact_relax.surface import ActiveHamiltonianSurface
 
 class FiniteDifferenceScanner:
 
+    reason_prefix = "gradient"
+
     def __init__(
         self,
         surface: ActiveHamiltonianSurface,
@@ -57,26 +59,24 @@ class FiniteDifferenceScanner:
         self.calls += 1
         coords = np.asarray(mol.atom_coords(), dtype=float)
         energy = self.surface.energy(
-            coords, "gradient-%d-center" % self.calls, accept_center=True
+            coords,
+            "%s-%d-center" % (self.reason_prefix, self.calls),
+            accept_center=True,
         )
         gradient = np.zeros_like(coords)
         for atom_index in self.movable:
             for axis in self.axes:
                 plus = coords.copy()
                 plus[atom_index, axis] += self.step_bohr
-                label = "gradient-%d-a%d%s" % (
-                    self.calls, atom_index, "xyz"[axis]
+                label = "%s-%d-a%d%s" % (
+                    self.reason_prefix, self.calls, atom_index, "xyz"[axis]
                 )
-                ep = self.surface.energy(
-                    plus, label + "+", displaced_atom=atom_index
-                )
+                ep = self._displaced_energy(plus, label + "+", atom_index)
                 self._check_branch(ep, energy, label + "+")
                 if self.mode == "central":
                     minus = coords.copy()
                     minus[atom_index, axis] -= self.step_bohr
-                    em = self.surface.energy(
-                        minus, label + "-", displaced_atom=atom_index
-                    )
+                    em = self._displaced_energy(minus, label + "-", atom_index)
                     self._check_branch(em, energy, label + "-")
                     gradient[atom_index, axis] = (
                         (ep - em) / (2.0 * self.step_bohr)
@@ -90,6 +90,24 @@ class FiniteDifferenceScanner:
         self.last_gradient = gradient
         self.last_coords = coords.copy()
         return energy, gradient
+
+    def _displaced_energy(self, coords, reason, atom_index):
+        return self.surface.energy(
+            coords, reason, displaced_atom=atom_index
+        )
+
+
+class SemiAnalyticGradientScanner(FiniteDifferenceScanner):
+
+    reason_prefix = "semi-analytic-gradient"
+
+    def _displaced_energy(self, coords, reason, atom_index):
+        return self.surface.energy(
+            coords,
+            reason,
+            displaced_atom=atom_index,
+            relax_active=False,
+        )
 
 
 def write_constraints(

@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lattice-r", type=float, default=R_ANG)
     parser.add_argument("--vacuum", type=float, default=30.0)
     parser.add_argument("--seed-displace", type=float, default=0.0)
-    parser.add_argument("--coordsys", default="tric",
+    parser.add_argument("--coordsys", default="cart",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
 
     reference_policy = parser.add_mutually_exclusive_group()
@@ -58,10 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-center-subspace-overlap", type=float, default=0.0)
 
     parser.add_argument("--fd-step", type=float, default=1e-3)
-    parser.add_argument("--fd-axes", default="xyz")
-    parser.add_argument("--fd-mode", default="central",
+    parser.add_argument("--fd-axes", default="x")
+    parser.add_argument("--fd-mode", default="forward",
                         choices=("central", "forward"))
     parser.add_argument("--max-gradient", type=float, default=1.0)
+    parser.add_argument("--semi-analytic-gradient",
+                        "--semi-analytical-gradient", action="store_true")
 
     parser.add_argument("--maxsteps", type=int, default=50)
     parser.add_argument("--convergence-energy", type=float, default=1e-6)

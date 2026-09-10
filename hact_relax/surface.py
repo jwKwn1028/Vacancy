@@ -211,13 +211,22 @@ class ActiveHamiltonianSurface:
         *,
         accept_center: bool = False,
         displaced_atom: int | None = None,
+        relax_active: bool = True,
     ) -> float:
+        if accept_center and not relax_active:
+            raise ValueError(
+                "an accepted centre requires active-space relaxation"
+            )
+        if not relax_active and self.active_solution_reference is None:
+            raise RuntimeError(
+                "a semi-analytic displacement requires an accepted centre"
+            )
         settings = self.settings
         coords_bohr = np.asarray(coords_bohr, dtype=float).reshape(-1, 3)
         strict_continuation = displaced_atom is not None
 
         key = self._key(coords_bohr)
-        cached = self.cache.get(key)
+        cached = self.cache.get(key) if relax_active else None
         if (cached is not None
                 and (not accept_center or self.last_accepted_key == key)):
             return cached
@@ -327,27 +336,47 @@ class ActiveHamiltonianSurface:
                 start_rotation = None
                 start_occ = None
 
-        result = solver.kernel(
-            conv_tol=settings.scf_conv_tol,
-            conv_tol_grad=settings.scf_conv_tol_grad,
-            start_rotation=start_rotation,
-            start_occ=start_occ,
-        )
+        if relax_active:
+            result = solver.kernel(
+                conv_tol=settings.scf_conv_tol,
+                conv_tol_grad=settings.scf_conv_tol_grad,
+                start_rotation=start_rotation,
+                start_occ=start_occ,
+            )
 
-        if not result[0] and settings.rescue_unconverged_scf:
-            if accept_center:
-                result = self._rescue_unconverged_scf(result)
-            elif start_rotation is not None:
-                result = self._converge_on_center_branch(
-                    solver, result, start_rotation, start_occ
+            if not result[0] and settings.rescue_unconverged_scf:
+                if accept_center:
+                    result = self._rescue_unconverged_scf(result)
+                elif start_rotation is not None:
+                    result = self._converge_on_center_branch(
+                        solver, result, start_rotation, start_occ
+                    )
+
+            if (result[0]
+                    and (accept_center or self.last_center_followed)
+                    and settings.follow_negative_mode):
+                result, followed = self._follow_negative_mode(result)
+                if accept_center:
+                    self.last_center_followed = bool(followed)
+        else:
+            if start_rotation is None or start_occ is None:
+                raise RuntimeError(
+                    "the accepted active state could not be transported"
                 )
-
-        if (result[0]
-                and (accept_center or self.last_center_followed)
-                and settings.follow_negative_mode):
-            result, followed = self._follow_negative_mode(result)
-            if accept_center:
-                self.last_center_followed = bool(followed)
+            coeff, occ, h1e, vhf, eri = solver._start_frame(
+                solver.mo_coeff[:, solver.active_orb],
+                start_rotation,
+                start_occ,
+            )
+            result = [
+                True,
+                float(solver.energy_elec(h1e, vhf, occ)),
+                np.zeros_like(occ),
+                coeff,
+                occ,
+                h1e,
+                eri,
+            ]
 
         if not result[0]:
             raise SCFNotConverged(
@@ -379,7 +408,8 @@ class ActiveHamiltonianSurface:
             self.cache.clear()
             self.last_accepted_key = key
 
-        self.cache[key] = energy
+        if relax_active:
+            self.cache[key] = energy
         print("# %-26s E=% .12f Ha" % (reason, energy), flush=True)
         gc.collect()
         return energy

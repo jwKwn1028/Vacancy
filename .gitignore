@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 result/
+tools/
 *.sh
 *.md
-
+*.pdf

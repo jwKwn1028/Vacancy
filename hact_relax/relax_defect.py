@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--fd-step", type=float, default=1e-3)
     parser.add_argument("--fd-axes", default="x")
-    parser.add_argument("--fd-mode", default="forward",
+    parser.add_argument("--fd-mode", default="central",
                         choices=("central", "forward"))
     parser.add_argument("--max-gradient", type=float, default=1.0)
     parser.add_argument("--semi-analytic-gradient",

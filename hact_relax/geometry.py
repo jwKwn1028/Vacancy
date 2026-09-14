@@ -94,14 +94,19 @@ def build_starting_geometry(
 
 
 def write_xyz(
-    path: Path, labels: Sequence[str], coords_bohr: np.ndarray, comment: str
+    path: Path,
+    labels: Sequence[str],
+    coords_bohr: np.ndarray,
+    comment: str,
+    append: bool = False,
 ) -> None:
     lines = [str(len(labels)), comment]
     for label, xyz in zip(labels, np.asarray(coords_bohr) * BOHR):
         lines.append("%-10s %18.10f %18.10f %18.10f"
                      % (label, xyz[0], xyz[1], xyz[2]))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
+    with path.open("a" if append else "w") as handle:
+        handle.write("\n".join(lines) + "\n")
 
 
 def check_geometry_fits_lattice(

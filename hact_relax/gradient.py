@@ -6,7 +6,36 @@ from typing import Sequence
 import numpy as np
 
 from hact_relax.errors import BranchFlip
+from hact_relax.geometry import write_xyz
 from hact_relax.surface import ActiveHamiltonianSurface
+
+
+class TrajectoryRecorder:
+
+    def __init__(self, output_dir: Path, labels: Sequence[str]):
+        self.labels = list(labels)
+        self.xyz_path = output_dir / "trajectory.xyz"
+        self.gradient_path = output_dir / "gradient_trajectory.npy"
+        self.gradients: list[np.ndarray] = []
+
+    def record(
+        self,
+        call: int,
+        coords_bohr: np.ndarray,
+        energy: float,
+        gradient: np.ndarray,
+    ) -> None:
+        gradient = np.asarray(gradient, dtype=float).reshape(len(self.labels), 3)
+        self.gradients.append(gradient.copy())
+        write_xyz(
+            self.xyz_path,
+            self.labels,
+            coords_bohr,
+            "gradient_call=%d E=%.16f Ha |g|=%.10e Ha/Bohr"
+            % (call, energy, np.linalg.norm(gradient)),
+            append=True,
+        )
+        np.save(self.gradient_path, np.stack(self.gradients))
 
 
 class FiniteDifferenceScanner:
@@ -21,8 +50,10 @@ class FiniteDifferenceScanner:
         max_gradient: float = 1.0,
         axes: Sequence[int] = (0, 1, 2),
         mode: str = "central",
+        trajectory: TrajectoryRecorder | None = None,
     ):
         self.surface = surface
+        self.trajectory = trajectory
         self.movable = tuple(int(i) for i in movable)
         self.step_bohr = float(step_bohr)
         self.max_gradient = float(max_gradient)
@@ -89,6 +120,8 @@ class FiniteDifferenceScanner:
         self.last_energy = energy
         self.last_gradient = gradient
         self.last_coords = coords.copy()
+        if self.trajectory is not None:
+            self.trajectory.record(self.calls, coords, energy, gradient)
         return energy, gradient
 
     def _displaced_energy(self, coords, reason, atom_index):

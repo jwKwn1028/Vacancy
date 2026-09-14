@@ -27,6 +27,7 @@ from hact_relax.geometry import (
 from hact_relax.gradient import (
     FiniteDifferenceScanner,
     SemiAnalyticGradientScanner,
+    TrajectoryRecorder,
     save_final_gradient,
     write_constraints,
 )
@@ -156,6 +157,7 @@ def run_one(
         args.max_gradient,
         axes=args.fd_axis_indices,
         mode=args.fd_mode,
+        trajectory=TrajectoryRecorder(output_dir, labels),
     )
 
     constraints_path = None if args.coordsys == "cart" else constraints

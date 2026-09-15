@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from pyscf.pbc.gto import cell as pbc_cell
+
+from frozen_bath_scf.casci import _fake_mf, _run_casci
 
 
 @dataclass
@@ -239,4 +243,203 @@ def make_pristine_reference(kmf) -> PristineReference:
         cell=kmf.cell,
         density=np.asarray(kmf.make_rdm1()).copy(),
         occupied_coeff=coeff[:, occ_gamma > 0].copy(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# CASCI on H_act^V, with maximum-overlap orbital and root tracking.
+#
+# The relaxation needs the SAME excited state at every finite-difference point,
+# which is two separate tracking problems:
+#
+#   1. the active orbitals must be put in a common frame across geometries,
+#      otherwise CI vectors from two geometries are not comparable at all;
+#   2. within that frame, the root carrying the tracked state must be identified,
+#      since CASCI returns roots in energy order and roots cross.
+#
+# (1) is a Hungarian assignment on the cross-geometry AO overlap plus a sign fix;
+# (2) is a modulus CI overlap against the last accepted centre.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CASCIReference:
+    """The tracked state at the last accepted centre."""
+
+    cell: object
+    ordered_active_coeff: np.ndarray
+    ci_vector: np.ndarray
+
+
+@dataclass
+class CASCIResult:
+    energy: float
+    s_squared: float
+    ncore: int
+    orbital_order: np.ndarray
+    root_energies: np.ndarray
+    root_s_squared: np.ndarray
+    ci_vectors: list[np.ndarray]
+    nalpha: int
+    nbeta: int
+    requested_root: int
+    selected_root: int
+    root_overlaps: np.ndarray
+    ordered_active_coeff: np.ndarray | None
+    orbital_min_overlap: float | None
+    orbital_subspace_singular_values: np.ndarray | None = None
+
+
+def _normalized_ci_overlaps(
+    reference: np.ndarray, vectors: Sequence[np.ndarray]
+) -> np.ndarray:
+    ref = np.asarray(reference)
+    values = []
+    for vector in vectors:
+        vec = np.asarray(vector)
+        if vec.shape != ref.shape:
+            # CI vector shape is (n_alpha_strings, n_beta_strings) and therefore
+            # spin-sector dependent.  Ravelling mismatched shapes would compare
+            # unrelated determinants and silently return a plausible number.
+            raise ValueError(
+                "CI vector shape %s does not match the tracked reference %s; "
+                "the CAS or the spin sector changed between geometries"
+                % (vec.shape, ref.shape)
+            )
+        flat_ref = ref.ravel()
+        flat_vec = vec.ravel()
+        denom = np.linalg.norm(flat_ref) * np.linalg.norm(flat_vec)
+        values.append(0.0 if denom == 0 else abs(np.vdot(flat_ref, flat_vec)) / denom)
+    return np.asarray(values, dtype=float)
+
+
+def casci_energy(
+    solver,
+    result,
+    *,
+    ncas: int,
+    ncas_elec: int,
+    two_s: int,
+    root: int,
+    nroots: int,
+    reference: CASCIReference | None = None,
+) -> CASCIResult:
+    """CASCI on ``H_act^V`` with maximum-overlap orbital/root tracking."""
+    h1e = np.asarray(result[5]).real
+    eri = np.asarray(result[6]).real
+    orbital_energy = np.asarray(result[2]).real
+    active_coeff = None if result[3] is None else np.asarray(result[3]).real
+
+    orbital_min_overlap = None
+    orbital_subspace_singular_values = None
+    if reference is None:
+        # Without a reference the CAS window is placed by Fock energy.  The
+        # relax_active=False path returns zeros for result[2], so ordering would
+        # silently degenerate into "by index" -- refuse instead.  A semi-analytic
+        # displaced point always has an accepted centre, so this cannot fire
+        # there; it fires only if a frozen evaluation is ever reached first.
+        if orbital_energy.size and np.ptp(orbital_energy) == 0.0:
+            raise RuntimeError(
+                "CASCI cannot order the active space: the orbital energies are "
+                "all equal, so no frontier window can be identified.  This "
+                "happens on a frozen (relax_active=False) evaluation reached "
+                "without an accepted centre."
+            )
+        order = np.argsort(orbital_energy)
+        signs = np.ones(order.size)
+    else:
+        if (active_coeff is None
+                or active_coeff.shape != reference.ordered_active_coeff.shape):
+            raise RuntimeError(
+                "CASCI active-orbital dimension changed during root tracking"
+            )
+        match = match_orbital_subspaces(
+            reference.cell,
+            reference.ordered_active_coeff,
+            solver.scell,
+            active_coeff,
+            target_overlap=getattr(solver, "S", None),
+        )
+        overlap = np.asarray(match.overlap).real
+        rows, columns = linear_sum_assignment(-np.abs(overlap))
+        order = columns[np.argsort(rows)]
+        matched = overlap[np.arange(order.size), order]
+        signs = np.where(matched < 0.0, -1.0, 1.0)
+        orbital_min_overlap = float(np.min(np.abs(matched))) if matched.size else 1.0
+        orbital_subspace_singular_values = match.singular_values.copy()
+
+    h1e = h1e[np.ix_(order, order)]
+    eri = eri[np.ix_(order, order, order, order)]
+    h1e = h1e * (signs[:, None] * signs[None, :])
+    eri = eri * (
+        signs[:, None, None, None]
+        * signs[None, :, None, None]
+        * signs[None, None, :, None]
+        * signs[None, None, None, :]
+    )
+    ordered_active_coeff = (
+        None if active_coeff is None else active_coeff[:, order] * signs[None, :]
+    )
+
+    active_electrons = (
+        int(sum(solver.nelecas)) if np.ndim(solver.nelecas) else int(solver.nelecas)
+    )
+    if (active_electrons - ncas_elec) % 2:
+        raise ValueError(
+            "CAS electron count leaves a non-integer doubly occupied core: "
+            "active=%d, CAS=%d" % (active_electrons, ncas_elec)
+        )
+    ncore = (active_electrons - ncas_elec) // 2
+    nact = h1e.shape[0]
+    if ncore < 0 or ncore + ncas > nact:
+        raise ValueError(
+            "CAS(%de,%do) does not fit H_act^V: active_electrons=%d, nact=%d, "
+            "ncore=%d" % (ncas_elec, ncas, active_electrons, nact, ncore)
+        )
+
+    ecore = float(solver.E1e_core + solver.E2e_core + solver.Enuc)
+    fake_mf = _fake_mf(h1e, eri, ecore, active_electrons)
+    max_memory = getattr(solver, "max_memory", None)
+    if max_memory is not None:
+        fake_mf.max_memory = int(max_memory)
+        fake_mf.mol.max_memory = int(max_memory)
+    states = _run_casci(
+        fake_mf,
+        ncas,
+        ncas_elec,
+        two_s=two_s,
+        nroots=max(nroots, root + 1),
+        ncore=ncore,
+    )
+    states = sorted(states, key=lambda state: state[0])
+    if root >= len(states):
+        raise ValueError(
+            "CASCI returned %d roots, so zero-based root %d does not exist; "
+            "enlarge the CAS or select a lower root" % (len(states), root)
+        )
+
+    ci_vectors = [np.asarray(state[2]) for state in states]
+    if reference is None:
+        root_overlaps = np.full(len(states), np.nan)
+        selected_root = int(root)
+    else:
+        root_overlaps = _normalized_ci_overlaps(reference.ci_vector, ci_vectors)
+        selected_root = int(np.argmax(root_overlaps))
+
+    return CASCIResult(
+        energy=float(states[selected_root][0]),
+        s_squared=float(states[selected_root][1]),
+        ncore=ncore,
+        orbital_order=np.asarray(order, dtype=int),
+        root_energies=np.asarray([state[0] for state in states], dtype=float),
+        root_s_squared=np.asarray([state[1] for state in states], dtype=float),
+        ci_vectors=ci_vectors,
+        nalpha=int(states[0][3]),
+        nbeta=int(states[0][4]),
+        requested_root=int(root),
+        selected_root=selected_root,
+        root_overlaps=root_overlaps,
+        ordered_active_coeff=ordered_active_coeff,
+        orbital_min_overlap=orbital_min_overlap,
+        orbital_subspace_singular_values=orbital_subspace_singular_values,
     )

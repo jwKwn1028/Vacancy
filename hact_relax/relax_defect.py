@@ -16,6 +16,7 @@ from hact_relax._bootstrap import REPO, THREADS
 from pyscf import lib
 
 from hact_relax.cases import (
+    CASES,
     CHAIN_CELLS,
     R_ANG,
     parse_cases,
@@ -50,6 +51,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--follow-negative-mode", action="store_true")
     parser.add_argument("--min-subspace-overlap", type=float, default=0.5)
     parser.add_argument("--min-center-subspace-overlap", type=float, default=0.0)
+
+    parser.add_argument("--state", choices=("ground", "excited"),
+                        default="ground",
+                        help="ground: relax on the frozen-bath SCF energy. "
+                             "excited: relax on a tracked CASCI root of the "
+                             "same H_act^V")
+    parser.add_argument("--root", type=int, default=1,
+                        help="zero-based CASCI root, selected by energy at the "
+                             "first accepted centre and by maximum CI overlap "
+                             "thereafter")
+    parser.add_argument("--nroots", type=int, default=4)
+    parser.add_argument("--ncas", type=int,
+                        help="CAS orbitals; defaults to the case value")
+    parser.add_argument("--ncas-elec", type=int,
+                        help="CAS electrons; defaults to the case value")
+    parser.add_argument("--casci-two-s", type=int, default=None,
+                        help="CASCI spin sector as 2S (0 = singlet, 2 = "
+                             "triplet).  Defaults to the case's own spin. "
+                             "H_act^V is spin-free, so the same Hamiltonian can "
+                             "be diagonalized in another sector")
+    parser.add_argument("--min-casci-root-overlap", type=float, default=0.5,
+                        help="abort if no CASCI root overlaps the tracked state "
+                             "by this much")
 
     parser.add_argument("--fd-step", type=float, default=1e-3)
     parser.add_argument("--fd-axes", default="x")
@@ -95,6 +119,51 @@ def validate_args(parser: argparse.ArgumentParser, args):
         parser.error("--min-subspace-overlap must be between zero and one")
     if not 0.0 <= args.min_center_subspace_overlap <= 1.0:
         parser.error("--min-center-subspace-overlap must be between zero and one")
+    if args.root < 0:
+        parser.error("--root is zero-based and must not be negative")
+    if args.nroots < 1:
+        parser.error("--nroots must be positive")
+    if not 0.0 <= args.min_casci_root_overlap <= 1.0:
+        parser.error("--min-casci-root-overlap must be between zero and one")
+    if (args.state != "ground"
+            and args.min_center_subspace_overlap < args.min_subspace_overlap):
+        print("# warning: --min-center-subspace-overlap (%g) is below "
+              "--min-subspace-overlap (%g).  On --state excited the centre "
+              "fallback re-seeds the SCF in an unrelated orbital frame, which "
+              "the CASCI orbital guard then rejects anyway -- the run aborts "
+              "later and with a less obvious message"
+              % (args.min_center_subspace_overlap, args.min_subspace_overlap),
+              flush=True)
+    if args.state == "ground" and args.casci_two_s is not None:
+        print("# warning: --casci-two-s is ignored with --state ground",
+              flush=True)
+    if args.state != "ground":
+        for name in cases:
+            case = CASES[name]
+            ncas = args.ncas if args.ncas is not None else case.ncas
+            ncas_elec = (args.ncas_elec if args.ncas_elec is not None
+                         else case.ncas_elec)
+            if ncas < 1 or ncas_elec < 0:
+                parser.error("--ncas must be positive and --ncas-elec "
+                             "non-negative (case %s)" % name)
+            if ncas_elec > 2 * ncas:
+                parser.error(
+                    "CAS(%de,%do) holds at most %d electrons (case %s)"
+                    % (ncas_elec, ncas, 2 * ncas, name)
+                )
+            two_s = case.spin if args.casci_two_s is None else args.casci_two_s
+            if two_s < 0:
+                parser.error("--casci-two-s is 2S and must not be negative")
+            if (two_s - ncas_elec) % 2:
+                parser.error(
+                    "2S=%d has the wrong parity for %d CAS electrons (case %s)"
+                    % (two_s, ncas_elec, name)
+                )
+            if two_s > min(ncas_elec, 2 * ncas - ncas_elec):
+                parser.error(
+                    "2S=%d exceeds the maximum spin of CAS(%de,%do) (case %s)"
+                    % (two_s, ncas_elec, ncas, name)
+                )
     axes = "".join(dict.fromkeys(str(args.fd_axes).strip().lower()))
     if not axes or set(axes) - set("xyz"):
         parser.error("--fd-axes must be a non-empty subset of 'xyz'")

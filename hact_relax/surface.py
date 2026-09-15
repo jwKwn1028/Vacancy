@@ -21,14 +21,20 @@ from frozen_bath_scf.schmidt_embedding import (
 from system.pristine import build_pristine_mean_field
 
 from hact_relax.cases import CASES
-from hact_relax.errors import SCFNotConverged, SubspaceContinuityError
+from hact_relax.errors import (
+    RootContinuityError,
+    SCFNotConverged,
+    SubspaceContinuityError,
+)
 from hact_relax.geometry import restored_pristine_atoms
 from hact_relax.recording import NullRecorder
 from hact_relax.tracking import (
     ActiveSolutionReference,
+    CASCIReference,
     PristineReference,
     align_pristine_occupied_subspace,
     defect_orbital_index,
+    casci_energy,
     make_pristine_reference,
     transport_active_solution,
     transport_defect_orbital,
@@ -56,6 +62,15 @@ class SurfaceSettings:
     rescue_unconverged_scf: bool = False
     rescue_tol_factor: float = 5.0
     checkpoint_eri: bool = True
+    # --state excited: CASCI on H_act^V instead of the frozen-bath SCF energy.
+    # Defaults reproduce the sibling repository's own defaults.
+    state: str = "ground"
+    root: int = 1
+    nroots: int = 4
+    ncas: int = 0
+    ncas_elec: int = 0
+    casci_two_s: int | None = None
+    min_casci_root_overlap: float = 0.5
 
 
 class ActiveHamiltonianSurface:
@@ -80,6 +95,7 @@ class ActiveHamiltonianSurface:
         self.last_accepted_key: str | None = None
         self.pristine_reference: PristineReference | None = None
         self.active_solution_reference: ActiveSolutionReference | None = None
+        self.casci_reference: CASCIReference | None = None
         self.fixed_n_bath: int | None = None
         self.fixed_fragment_atoms: tuple[int, ...] | None = None
         self.last_center_followed = False
@@ -603,6 +619,7 @@ class ActiveHamiltonianSurface:
             result[1] + solver.E1e_core + solver.E2e_core + solver.Enuc
         )
         record.update({
+            "surface": settings.state,
             "energy_hartree": energy,
             "e_total_hact_v_hartree": energy,
             "e_active_hartree": float(result[1]),
@@ -610,13 +627,110 @@ class ActiveHamiltonianSurface:
             "e2e_core_hartree": float(solver.E2e_core),
             "enuc_hartree": float(solver.Enuc),
             "core_energy_computed": True,
+            "n_active_orbitals": int(np.sum(solver.active_orb)),
+            "n_active_electrons": (
+                int(sum(solver.nelecas)) if np.ndim(solver.nelecas)
+                else int(solver.nelecas)
+            ),
         })
+
+        casci = None
+        if settings.state != "ground":
+            if not relax_active and self.casci_reference is None:
+                # Without a tracked reference casci_energy orders the CAS window
+                # by SCF orbital energy -- and a frozen frame carries none
+                # (result[2] is zeros), so it would silently pick an arbitrary
+                # window and return a plausible number.
+                raise RuntimeError(
+                    "a semi-analytic CASCI displacement requires an accepted "
+                    "centre with a tracked CI reference"
+                )
+            # CASCI replaces the SCF active energy; the core terms are folded in
+            # by _fake_mf via energy_nuc, so casci.energy is already the total.
+            with self.recorder.stage(
+                "casci", evaluation=evaluation, reason=reason
+            ):
+                casci = casci_energy(
+                    solver,
+                    result,
+                    ncas=settings.ncas,
+                    ncas_elec=settings.ncas_elec,
+                    two_s=(self.case.spin if settings.casci_two_s is None
+                           else settings.casci_two_s),
+                    root=settings.root,
+                    nroots=settings.nroots,
+                    reference=self.casci_reference,
+                )
+            selected_overlap = (
+                None if self.casci_reference is None
+                else float(casci.root_overlaps[casci.selected_root])
+            )
+            record.update({
+                "energy_hartree": float(casci.energy),
+                "casci_energy_hartree": float(casci.energy),
+                "casci_s_squared": float(casci.s_squared),
+                "casci_root_energies": casci.root_energies.tolist(),
+                "casci_root_s_squared": casci.root_s_squared.tolist(),
+                "casci_two_s": int(self.case.spin if settings.casci_two_s is None
+                                   else settings.casci_two_s),
+                "casci_ncas": int(settings.ncas),
+                "casci_ncas_elec": int(settings.ncas_elec),
+                "cas_ncore": int(casci.ncore),
+                "requested_root": int(casci.requested_root),
+                "selected_root": int(casci.selected_root),
+                "root_overlaps": casci.root_overlaps.tolist(),
+                "selected_root_overlap": selected_overlap,
+                "cas_orbital_min_overlap": casci.orbital_min_overlap,
+            })
+
+            # Guard 1 -- the active orbitals must still be the same frame, or the
+            # CI vectors being compared are not comparable.
+            if (casci.orbital_min_overlap is not None
+                    and casci.orbital_min_overlap
+                    < settings.min_subspace_overlap):
+                self.recorder.evaluation({
+                    **record,
+                    "event": "energy_failed",
+                    "error": "CASCI active-orbital continuity lost",
+                    "wall_seconds": round(time.time() - started, 6),
+                })
+                raise SubspaceContinuityError(
+                    "minimum tracked active-orbital overlap %.6f is below %.6f"
+                    % (casci.orbital_min_overlap, settings.min_subspace_overlap),
+                    continuity_space="casci-active-orbitals",
+                )
+            # Guard 2 -- some root must still carry the tracked state.
+            if (selected_overlap is not None
+                    and selected_overlap < settings.min_casci_root_overlap):
+                self.recorder.evaluation({
+                    **record,
+                    "event": "energy_failed",
+                    "error": "CASCI root continuity lost",
+                    "wall_seconds": round(time.time() - started, 6),
+                })
+                raise RootContinuityError(
+                    "best CASCI root overlap %.6f is below %.6f: the tracked "
+                    "state is no longer among the %d computed roots"
+                    % (selected_overlap, settings.min_casci_root_overlap,
+                       len(casci.root_energies)),
+                    selected_root=int(casci.selected_root),
+                    root_overlaps=casci.root_overlaps.tolist(),
+                    min_casci_root_overlap=float(settings.min_casci_root_overlap),
+                )
+            energy = float(casci.energy)
         if accept_center:
             self.last_energy_terms = {
                 "e_active_hartree": float(result[1]),
                 "e1e_core_hartree": float(solver.E1e_core),
                 "e2e_core_hartree": float(solver.E2e_core),
                 "enuc_hartree": float(solver.Enuc),
+                # The relaxed surface and the underlying SCF total differ once
+                # --state excited is in play.
+                "e_total_hact_v_hartree": float(
+                    result[1] + solver.E1e_core + solver.E2e_core + solver.Enuc
+                ),
+                "e_casci_hartree": (None if casci is None
+                                    else float(casci.energy)),
             }
 
         if accept_center:
@@ -628,6 +742,16 @@ class ActiveHamiltonianSurface:
                 active_occ=np.asarray(result[4]).real.copy(),
                 defect_index=defect_orbital_index(solver, accepted_coeff),
             )
+            if casci is not None:
+                if casci.ordered_active_coeff is None:
+                    raise RuntimeError(
+                        "CASCI did not return active orbitals for root tracking"
+                    )
+                self.casci_reference = CASCIReference(
+                    cell=solver.scell,
+                    ordered_active_coeff=casci.ordered_active_coeff.copy(),
+                    ci_vector=casci.ci_vectors[casci.selected_root].copy(),
+                )
             if self.fixed_n_bath is None:
                 self.fixed_n_bath = int(solver.n_bath)
             if self.fixed_fragment_atoms is None:

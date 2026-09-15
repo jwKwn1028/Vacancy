@@ -78,8 +78,33 @@ def run_configuration(
     return {
         "case_name": case_name,
         "fragment": fragment,
-        "state": "ground",
-        "relaxed_on": "E[H_act^V]",
+        "state": str(getattr(args, "state", "ground")),
+        "relaxed_on": ("E[H_act^V]"
+                       if getattr(args, "state", "ground") == "ground"
+                       else "CASCI root of H_act^V"),
+        "root": int(getattr(args, "root", 1)),
+        "nroots": int(getattr(args, "nroots", 4)),
+        "ncas": (int(args.ncas) if getattr(args, "ncas", None) is not None
+                 else case.ncas),
+        "ncas_elec": (int(args.ncas_elec)
+                      if getattr(args, "ncas_elec", None) is not None
+                      else case.ncas_elec),
+        "casci_two_s": (None if getattr(args, "casci_two_s", None) is None
+                        else int(args.casci_two_s)),
+        "casci_two_s_effective": int(
+            case.spin if getattr(args, "casci_two_s", None) is None
+            else args.casci_two_s
+        ),
+        "min_casci_root_overlap": float(
+            getattr(args, "min_casci_root_overlap", 0.5)
+        ),
+        "casci_root_policy": (
+            "requested energy root initially, maximum CI overlap thereafter"
+        ),
+        "casci_cas_window_policy": (
+            "Fock-energy-sorted active orbitals [ncore, ncore + ncas), "
+            "ncore = (n_active_elec - ncas_elec) // 2"
+        ),
         "basis": args.basis,
         "auxbasis": None,
         "chain_cells": chain_cells,
@@ -200,6 +225,8 @@ def run_one(
         raise ValueError("no real atoms selected for relaxation")
 
     output_stem = "%s-frag%d" % (case_name, fragment)
+    if getattr(args, "state", "ground") != "ground":
+        output_stem += "-%s-root%d" % (args.state, int(args.root))
     if getattr(args, "semi_analytic_gradient", False):
         output_stem += "-semi-analytic"
     output_dir = unique_output_dir(args.output_dir, output_stem)
@@ -223,6 +250,19 @@ def run_one(
         rescue_unconverged_scf=bool(args.rescue_unconverged_scf),
         rescue_tol_factor=float(args.rescue_tol_factor),
         checkpoint_eri=not bool(getattr(args, "no_eri_checkpoint", False)),
+        state=str(getattr(args, "state", "ground")),
+        root=int(getattr(args, "root", 1)),
+        nroots=int(getattr(args, "nroots", 4)),
+        ncas=(int(args.ncas) if getattr(args, "ncas", None) is not None
+              else case.ncas),
+        ncas_elec=(int(args.ncas_elec)
+                   if getattr(args, "ncas_elec", None) is not None
+                   else case.ncas_elec),
+        casci_two_s=(None if getattr(args, "casci_two_s", None) is None
+                     else int(args.casci_two_s)),
+        min_casci_root_overlap=float(
+            getattr(args, "min_casci_root_overlap", 0.5)
+        ),
     )
     driver_mol = build_driver_molecule(
         labels, coords_bohr, case, args.basis, args.memory_mb, args.verbose
@@ -327,7 +367,12 @@ def run_one(
         outcome.update({
             "run_status": "complete",
             "final_energy_hartree": float(energy),
-            "final_total_hact_v_hartree": float(energy),
+            "final_total_hact_v_hartree": (
+                None if surface.last_energy_terms is None
+                else surface.last_energy_terms.get("e_total_hact_v_hartree")),
+            "final_casci_hartree": (
+                None if surface.last_energy_terms is None
+                else surface.last_energy_terms.get("e_casci_hartree")),
             "final_energy_terms_hartree": surface.last_energy_terms,
             "final_gradient_norm_hartree_per_bohr": float(
                 np.linalg.norm(np.asarray(gradient))

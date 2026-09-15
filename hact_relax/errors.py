@@ -18,3 +18,7 @@ class SubspaceContinuityError(_ContextError):
 
 class GeometryOptimizationNotConverged(_ContextError):
     pass
+
+
+class RootContinuityError(_ContextError):
+    pass

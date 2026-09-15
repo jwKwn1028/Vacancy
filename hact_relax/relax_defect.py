@@ -69,6 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-unconverged-geometry", action="store_true")
     parser.add_argument("--single-point", action="store_true")
 
+    parser.add_argument("--resource-interval", type=float, default=30.0)
+    parser.add_argument("--no-eri-checkpoint", action="store_true")
+
     parser.add_argument("--threads", type=int, default=THREADS)
     parser.add_argument("--memory-mb", type=int,
                         default=int(os.environ.get("SLURM_MEM_PER_NODE", "4000")))

@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 
 
@@ -48,6 +50,8 @@ def build_pristine_mean_field(
     max_cycle=200,
     dm0=None,
     auxbasis=None,
+    callback=None,
+    chkfile=None,
 ):
     from pyscf.pbc import gto, scf
 
@@ -82,7 +86,11 @@ def build_pristine_mean_field(
             )
 
     _install_pristine_hcore_capture(kmf)
+    if callback is not None:
+        kmf.callback = callback
     kmf.kernel(dm0=dm0)
     if not kmf.converged:
         raise RuntimeError("pristine KRHF did not converge")
+    if chkfile is not None:
+        kmf.dump_chk(os.fspath(chkfile))
     return cell, kmf

@@ -4,6 +4,9 @@ from pyscf import lib
 
 
 class FrozenActiveSpace:
+
+    scf_callback = None
+
     def get_h1e(self):
         h1e_ao_ao = self.hcore.copy()
         h1e_ao_ao -= self._nuc_ao_integral_for_atom()

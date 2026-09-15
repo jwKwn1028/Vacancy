@@ -84,6 +84,9 @@ class Frozen_ROHF(FrozenActiveSpace, rohf.ROHF):
             fock = self.get_fock(h1e, eye, vhf, dm, cycle, level_shift_factor=0.0)
             norm_gorb = np.linalg.norm(self.get_grad(eye, mo_occ, fock))
 
+            if self.scf_callback is not None:
+                self.scf_callback(cycle + 1, e_elec, e_elec - last_hf_e, norm_gorb)
+
             if abs(e_elec - last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
                 scf_conv = True
                 break

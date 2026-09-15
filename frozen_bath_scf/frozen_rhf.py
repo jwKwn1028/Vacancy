@@ -66,6 +66,9 @@ class Frozen_RHF(FrozenActiveSpace, hf.SCF):
                 )
             )
 
+            if self.scf_callback is not None:
+                self.scf_callback(cycle + 1, e_elec, e_elec - last_hf_e, norm_gorb)
+
             if abs(e_elec - last_hf_e) < conv_tol and norm_gorb < conv_tol_grad:
                 scf_conv = True
                 break

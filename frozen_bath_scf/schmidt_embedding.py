@@ -52,6 +52,7 @@ class _SchmidtEmbedding:
         core_initial = 0 if self.compute_core_energy else None
         self.E1e_core = self.E2e_core = self.Enuc = core_initial
         self.eri_active = None
+        self.bath_singular_values = None
         self._c_def = None
 
     def build(self):
@@ -204,6 +205,7 @@ class _SchmidtEmbedding:
         if P_EF.shape[1] != nF:
             raise RuntimeError("Schmidt SVD lost fragment columns")
         U, s, _ = np.linalg.svd(P_EF, full_matrices=True)
+        self.bath_singular_values = np.asarray(s, dtype=float).copy()
         if self.fixed_n_bath is None:
             n_bath = int(np.sum(s > self.bath_tol))
         else:

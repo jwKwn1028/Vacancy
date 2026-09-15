@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import gc
 import hashlib
-from typing import Sequence
+import time
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -22,6 +23,7 @@ from system.pristine import build_pristine_mean_field
 from hact_relax.cases import CASES
 from hact_relax.errors import SCFNotConverged, SubspaceContinuityError
 from hact_relax.geometry import restored_pristine_atoms
+from hact_relax.recording import NullRecorder
 from hact_relax.tracking import (
     ActiveSolutionReference,
     PristineReference,
@@ -53,6 +55,7 @@ class SurfaceSettings:
     follow_mode_tol: float = 1e-8
     rescue_unconverged_scf: bool = False
     rescue_tol_factor: float = 5.0
+    checkpoint_eri: bool = True
 
 
 class ActiveHamiltonianSurface:
@@ -63,8 +66,12 @@ class ActiveHamiltonianSurface:
         labels: Sequence[str],
         vacancy_index: int,
         lattice_bohr: np.ndarray,
+        recorder=None,
     ):
         self.settings = settings
+        self.recorder = (
+            NullRecorder() if recorder is None else recorder
+        )
         self.case = CASES[settings.case_name]
         self.labels = list(labels)
         self.vacancy_index = int(vacancy_index)
@@ -76,6 +83,8 @@ class ActiveHamiltonianSurface:
         self.fixed_n_bath: int | None = None
         self.fixed_fragment_atoms: tuple[int, ...] | None = None
         self.last_center_followed = False
+        self.last_energy_terms: dict[str, float] | None = None
+        self.measured_noise_floor: float | None = None
 
     @staticmethod
     def _key(coords_bohr: np.ndarray) -> str:
@@ -123,7 +132,7 @@ class ActiveHamiltonianSurface:
 
     def _rescue_unconverged_scf(self, result):
         if result[5] is None or result[6] is None:
-            return result
+            return result, {"scf_rescued": False}
         h1e = np.asarray(result[5]).real
         eri = np.asarray(result[6]).real
         occ = np.asarray(result[4]).real
@@ -134,16 +143,22 @@ class ActiveHamiltonianSurface:
             so.orbital_gradient(h1e, eri, occ, kappa)
         ))
         if gradient > self._rescue_limit():
-            return result
+            return result, {
+                "scf_rescued": False,
+                "scf_rescue_gradient_norm": gradient,
+            }
         updated = self._apply_orbital_rotation(
             result, kappa, float(energy_at(h1e, eri, occ, kappa))
         )
         updated[0] = True
-        return updated
+        return updated, {
+            "scf_rescued": True,
+            "scf_rescue_gradient_norm": gradient,
+        }
 
     def _converge_on_center_branch(self, solver, result, start_rotation, start_occ):
         if start_rotation is None or start_occ is None:
-            return result
+            return result, {"scf_rescued_on_center_branch": False}
         u0 = np.asarray(start_rotation, dtype=float)
         occ = np.asarray(start_occ, dtype=float).copy()
         h1e = np.asarray(solver.get_hcore(solver.heff, u0)).real
@@ -156,7 +171,10 @@ class ActiveHamiltonianSurface:
             so.orbital_gradient(h1e, eri, occ, kappa)
         ))
         if gradient > self._rescue_limit():
-            return result
+            return result, {
+                "scf_rescued_on_center_branch": False,
+                "scf_rescue_gradient_norm": gradient,
+            }
         seed = [
             True,
             float(energy_at(h1e, eri, occ)),
@@ -170,24 +188,107 @@ class ActiveHamiltonianSurface:
             seed, kappa, float(energy_at(h1e, eri, occ, kappa))
         )
         updated[0] = True
-        return updated
+        return updated, {
+            "scf_rescued_on_center_branch": True,
+            "scf_rescue_gradient_norm": gradient,
+        }
 
     def _follow_negative_mode(self, result):
         h1e = np.asarray(result[5]).real
         eri = np.asarray(result[6]).real
         occ = np.asarray(result[4]).real
         report = so.stability_analysis(h1e, eri, occ)
+        info = {
+            "negative_mode_eigenvalue": float(report["lowest"]),
+            "negative_mode_followed": False,
+            "negative_mode_energy_drop_hartree": None,
+        }
         if report["lowest"] > -abs(self.settings.follow_mode_tol):
-            return result, False
+            return result, False, info
 
         before = energy_at(h1e, eri, occ)
         _, kappa = minimize_orbitals(
             h1e, eri, occ, 0.2 * np.asarray(report["lowest_mode"], dtype=float)
         )
         after = energy_at(h1e, eri, occ, kappa)
+        info["negative_mode_energy_drop_hartree"] = float(after - before)
         if not (after < before - abs(self.settings.follow_mode_tol)):
-            return result, False
-        return self._apply_orbital_rotation(result, kappa, after), True
+            return result, False, info
+        info["negative_mode_followed"] = True
+        return self._apply_orbital_rotation(result, kappa, after), True, info
+
+    def _embedding_record(self, solver) -> dict[str, Any]:
+        singular = np.asarray(
+            getattr(solver, "bath_singular_values", None)
+            if getattr(solver, "bath_singular_values", None) is not None
+            else [], dtype=float
+        )
+        n_bath = int(solver.n_bath)
+        kept_min = float(singular[:n_bath].min()) if n_bath else None
+        dropped_max = (
+            float(singular[n_bath:].max()) if singular.size > n_bath else None
+        )
+        active = np.asarray(solver.active_orb, dtype=bool)
+        return {
+            "n_entangled_bath": n_bath,
+            "threshold_n_entangled_bath": (
+                None if self.fixed_n_bath is None else int(self.fixed_n_bath)
+            ),
+            "bath_rank_locked": self.fixed_n_bath is not None,
+            "bath_tol": float(self.settings.bath_tol),
+            "bath_singular_value_kept_min": kept_min,
+            "bath_singular_value_dropped_max": dropped_max,
+            "bath_cut_ratio": (
+                None if not kept_min or dropped_max is None
+                else dropped_max / kept_min
+            ),
+            "fragment_atoms": [int(a) for a in sorted(solver.frag_atoms)],
+            "fragment_atoms_locked": self.fixed_fragment_atoms is not None,
+            "n_active_orbitals": int(active.sum()),
+            "n_active_electrons": int(round(float(
+                np.asarray(solver.mo_occ)[active].sum()
+            ))),
+        }
+
+    def _write_hact_checkpoint(
+        self, path, solver, result, energy, coords_bohr, key, evaluation
+    ) -> bool:
+        import h5py
+
+        singular = getattr(solver, "bath_singular_values", None)
+        with h5py.File(path, "w") as handle:
+            group = handle.create_group("hact")
+            group["case"] = self.settings.case_name
+            group["fragment"] = int(self.settings.fragment)
+            group["geometry_key"] = key
+            group["evaluation"] = int(evaluation)
+            group["converged"] = int(bool(result[0]))
+            group["kmesh"] = np.asarray(self.settings.reference_kmesh, dtype=int)
+            group["coords_bohr"] = np.asarray(coords_bohr, dtype=float)
+            group["labels"] = np.asarray(self.labels, dtype=h5py.special_dtype(vlen=str))
+            group["e_tot"] = float(energy)
+            group["e_elec_active"] = float(result[1])
+            group["e1e_core"] = float(solver.E1e_core)
+            group["e2e_core"] = float(solver.E2e_core)
+            group["enuc"] = float(solver.Enuc)
+            group["core_energy_computed"] = 1
+            group["mo_coeff_active"] = np.asarray(result[3]).real
+            group["mo_occ_active"] = np.asarray(result[4]).real
+            group["mo_energy_active"] = np.asarray(result[2]).real
+            group["h1e_active"] = np.asarray(result[5]).real
+            if self.settings.checkpoint_eri and result[6] is not None:
+                group["eri_active"] = np.asarray(result[6]).real
+            group["mo_coeff_embedding"] = np.asarray(solver.mo_coeff).real
+            group["mo_occ_embedding"] = np.asarray(solver.mo_occ).real
+            group["active_orb"] = np.asarray(solver.active_orb, dtype=np.int8)
+            group["n_bath"] = int(solver.n_bath)
+            group["bath_rank_locked"] = int(self.fixed_n_bath is not None)
+            group["fragment_atoms"] = np.asarray(
+                sorted(solver.frag_atoms), dtype=int
+            )
+            if singular is not None:
+                group["bath_singular_values"] = np.asarray(singular, dtype=float)
+        return True
 
     def energy(
         self,
@@ -209,33 +310,108 @@ class ActiveHamiltonianSurface:
         settings = self.settings
         coords_bohr = np.asarray(coords_bohr, dtype=float).reshape(-1, 3)
         strict_continuation = displaced_atom is not None
+        started = time.time()
+        evaluation = self.recorder.next_evaluation()
 
         key = self._key(coords_bohr)
         cached = self.cache.get(key) if relax_active else None
         if (cached is not None
                 and (not accept_center or self.last_accepted_key == key)):
+            self.recorder.evaluation({
+                "event": "energy_cache_hit",
+                "evaluation": evaluation,
+                "reason": reason,
+                "key": key,
+                "energy_hartree": float(cached),
+                "accept_center": bool(accept_center),
+                "relax_active": bool(relax_active),
+                "displaced_atom": (None if displaced_atom is None
+                                   else int(displaced_atom)),
+                "wall_seconds": round(time.time() - started, 6),
+            })
             return cached
 
+        record: dict[str, Any] = {
+            "event": "energy",
+            "evaluation": evaluation,
+            "reason": reason,
+            "key": key,
+            "case_name": settings.case_name,
+            "fragment": settings.fragment,
+            "accept_center": bool(accept_center),
+            "relax_active": bool(relax_active),
+            "strict_continuation": bool(strict_continuation),
+            "displaced_atom": (None if displaced_atom is None
+                               else int(displaced_atom)),
+            "pristine_kmesh": list(settings.reference_kmesh),
+            "pristine_reference_policy": "exact",
+            "checkpoint_saved": False,
+        }
+
         prior_pristine = self.pristine_reference
-        _, pristine_kmf = build_pristine_mean_field(
-            restored_pristine_atoms(self.labels, coords_bohr),
-            self.lattice_bohr,
-            settings.basis,
-            kmesh=settings.reference_kmesh,
-            pseudo=None,
-            charge=0,
-            spin=0,
-            exxdiv=None,
-            verbose=settings.verbose,
-            max_memory=settings.memory_mb,
-            conv_tol=settings.scf_conv_tol,
-            conv_tol_grad=settings.scf_conv_tol_grad,
-            max_cycle=settings.scf_max_cycle,
-            auxbasis=settings.auxbasis,
-            dm0=None if prior_pristine is None else prior_pristine.density,
-        )
+        pristine_scf: dict[str, Any] = {
+            "cycles": 0, "delta": None, "gradient": None
+        }
+
+        def pristine_callback(envs):
+            pristine_scf["cycles"] = int(envs["cycle"]) + 1
+            pristine_scf["delta"] = float(envs["e_tot"] - envs["last_hf_e"])
+            pristine_scf["gradient"] = float(envs["norm_gorb"])
+            self.recorder.scf_iteration({
+                "scf_kind": "pristine_krhf",
+                "evaluation": evaluation,
+                "reason": reason,
+                "cycle": pristine_scf["cycles"],
+                "energy_hartree": float(envs["e_tot"]),
+                "delta_energy_hartree": pristine_scf["delta"],
+                "orbital_gradient_norm": pristine_scf["gradient"],
+                "density_change_norm": float(envs["norm_ddm"]),
+            })
+
+        with self.recorder.stage(
+            "pristine_scf", evaluation=evaluation, reason=reason
+        ):
+            _, pristine_kmf = build_pristine_mean_field(
+                restored_pristine_atoms(self.labels, coords_bohr),
+                self.lattice_bohr,
+                settings.basis,
+                kmesh=settings.reference_kmesh,
+                pseudo=None,
+                charge=0,
+                spin=0,
+                exxdiv=None,
+                verbose=settings.verbose,
+                max_memory=settings.memory_mb,
+                conv_tol=settings.scf_conv_tol,
+                conv_tol_grad=settings.scf_conv_tol_grad,
+                max_cycle=settings.scf_max_cycle,
+                auxbasis=settings.auxbasis,
+                dm0=None if prior_pristine is None else prior_pristine.density,
+                callback=pristine_callback,
+                chkfile=(self.recorder.pristine_chkfile
+                         if accept_center else None),
+            )
+        record.update({
+            "pristine_energy_hartree": float(pristine_kmf.e_tot),
+            "pristine_scf_converged": bool(pristine_kmf.converged),
+            "pristine_scf_cycles": pristine_scf["cycles"],
+            "pristine_scf_final_delta_energy_hartree": pristine_scf["delta"],
+            "pristine_scf_final_orbital_gradient_norm": pristine_scf["gradient"],
+            "pristine_guess_from_previous_center": prior_pristine is not None,
+        })
+        if pristine_scf["delta"] is not None:
+            noise = abs(float(pristine_scf["delta"]))
+            self.measured_noise_floor = max(
+                noise, self.measured_noise_floor or 0.0
+            )
+            record["energy_noise_floor_hartree"] = noise
+            record["suggested_fd_step_bohr"] = (3.0 * noise) ** (1.0 / 3.0)
+
         occupied_match = align_pristine_occupied_subspace(
             pristine_kmf, prior_pristine
+        )
+        record["pristine_occupied_transport_fidelity"] = (
+            None if occupied_match is None else float(occupied_match.fidelity)
         )
         self._guard_pristine_overlap(
             None if occupied_match is None else occupied_match.fidelity,
@@ -259,15 +435,19 @@ class ActiveHamiltonianSurface:
             fixed_fragment_atoms=self.fixed_fragment_atoms,
             auxbasis=settings.auxbasis,
         )
-        if self.case.spin == 0:
-            solver = SchmidtEmbeddedRHF(
-                pristine_kmf, settings.reference_kmesh, **common
-            )
-        else:
-            solver = SchmidtEmbeddedROHF(
-                pristine_kmf, settings.reference_kmesh,
-                spin=self.case.spin, **common
-            )
+        with self.recorder.stage(
+            "embedding_build", evaluation=evaluation, reason=reason
+        ):
+            if self.case.spin == 0:
+                solver = SchmidtEmbeddedRHF(
+                    pristine_kmf, settings.reference_kmesh, **common
+                )
+            else:
+                solver = SchmidtEmbeddedROHF(
+                    pristine_kmf, settings.reference_kmesh,
+                    spin=self.case.spin, **common
+                )
+        record.update(self._embedding_record(solver))
 
         if solver.scell.natm != len(self.labels):
             raise RuntimeError(
@@ -285,12 +465,15 @@ class ActiveHamiltonianSurface:
 
         start_rotation = None
         start_occ = None
+        record["active_transport_fidelity"] = None
+        record["active_transport_fallback"] = False
         if self.active_solution_reference is not None:
             transport = transport_active_solution(
                 self.active_solution_reference, solver
             )
             start_rotation = transport.rotation
             start_occ = transport.occupations
+            record["active_transport_fidelity"] = float(transport.fidelity)
             transported_defect = transport_defect_orbital(
                 self.active_solution_reference, solver, start_rotation
             )
@@ -314,29 +497,65 @@ class ActiveHamiltonianSurface:
                     )
                 start_rotation = None
                 start_occ = None
+                record["active_transport_fallback"] = True
+
+        hact_scf: dict[str, Any] = {
+            "cycles": 0, "delta": None, "gradient": None
+        }
+
+        def hact_callback(cycle, energy_elec, delta, gradient_norm):
+            hact_scf["cycles"] = int(cycle)
+            hact_scf["delta"] = float(delta)
+            hact_scf["gradient"] = float(gradient_norm)
+            self.recorder.scf_iteration({
+                "scf_kind": "hact_frozen_bath",
+                "evaluation": evaluation,
+                "reason": reason,
+                "cycle": int(cycle),
+                "energy_hartree": float(energy_elec),
+                "delta_energy_hartree": float(delta),
+                "orbital_gradient_norm": float(gradient_norm),
+            })
+
+        solver.scf_callback = hact_callback
+        record.update({
+            "scf_rescued": False,
+            "scf_rescued_on_center_branch": False,
+            "scf_rescue_gradient_norm": None,
+            "negative_mode_eigenvalue": None,
+            "negative_mode_followed": False,
+            "negative_mode_energy_drop_hartree": None,
+            "hact_scf_continued_from_center": start_rotation is not None,
+        })
 
         if relax_active:
-            result = solver.kernel(
-                conv_tol=settings.scf_conv_tol,
-                conv_tol_grad=settings.scf_conv_tol_grad,
-                start_rotation=start_rotation,
-                start_occ=start_occ,
-            )
+            with self.recorder.stage(
+                "hact_scf", evaluation=evaluation, reason=reason
+            ):
+                result = solver.kernel(
+                    conv_tol=settings.scf_conv_tol,
+                    conv_tol_grad=settings.scf_conv_tol_grad,
+                    start_rotation=start_rotation,
+                    start_occ=start_occ,
+                )
 
-            if not result[0] and settings.rescue_unconverged_scf:
-                if accept_center:
-                    result = self._rescue_unconverged_scf(result)
-                elif start_rotation is not None:
-                    result = self._converge_on_center_branch(
-                        solver, result, start_rotation, start_occ
-                    )
+                if not result[0] and settings.rescue_unconverged_scf:
+                    if accept_center:
+                        result, rescue = self._rescue_unconverged_scf(result)
+                        record.update(rescue)
+                    elif start_rotation is not None:
+                        result, rescue = self._converge_on_center_branch(
+                            solver, result, start_rotation, start_occ
+                        )
+                        record.update(rescue)
 
-            if (result[0]
-                    and (accept_center or self.last_center_followed)
-                    and settings.follow_negative_mode):
-                result, followed = self._follow_negative_mode(result)
-                if accept_center:
-                    self.last_center_followed = bool(followed)
+                if (result[0]
+                        and (accept_center or self.last_center_followed)
+                        and settings.follow_negative_mode):
+                    result, followed, mode = self._follow_negative_mode(result)
+                    record.update(mode)
+                    if accept_center:
+                        self.last_center_followed = bool(followed)
         else:
             if start_rotation is None or start_occ is None:
                 raise RuntimeError(
@@ -357,7 +576,20 @@ class ActiveHamiltonianSurface:
                 eri,
             ]
 
+        record.update({
+            "hact_scf_converged": bool(result[0]),
+            "hact_scf_iterations_profiled": hact_scf["cycles"],
+            "hact_scf_final_delta_energy_hartree": hact_scf["delta"],
+            "hact_scf_final_orbital_gradient_norm": hact_scf["gradient"],
+        })
+
         if not result[0]:
+            self.recorder.evaluation({
+                **record,
+                "event": "energy_failed",
+                "error": "frozen-bath SCF on H_act^V did not converge",
+                "wall_seconds": round(time.time() - started, 6),
+            })
             raise SCFNotConverged(
                 "frozen-bath SCF on H_act^V did not converge", reason=reason
             )
@@ -370,6 +602,22 @@ class ActiveHamiltonianSurface:
         energy = float(
             result[1] + solver.E1e_core + solver.E2e_core + solver.Enuc
         )
+        record.update({
+            "energy_hartree": energy,
+            "e_total_hact_v_hartree": energy,
+            "e_active_hartree": float(result[1]),
+            "e1e_core_hartree": float(solver.E1e_core),
+            "e2e_core_hartree": float(solver.E2e_core),
+            "enuc_hartree": float(solver.Enuc),
+            "core_energy_computed": True,
+        })
+        if accept_center:
+            self.last_energy_terms = {
+                "e_active_hartree": float(result[1]),
+                "e1e_core_hartree": float(solver.E1e_core),
+                "e2e_core_hartree": float(solver.E2e_core),
+                "enuc_hartree": float(solver.Enuc),
+            }
 
         if accept_center:
             self.pristine_reference = next_pristine_reference
@@ -386,9 +634,19 @@ class ActiveHamiltonianSurface:
                 self.fixed_fragment_atoms = tuple(sorted(solver.frag_atoms))
             self.cache.clear()
             self.last_accepted_key = key
+            if self.recorder.hact_chkfile is not None:
+                with self.recorder.stage(
+                    "checkpoint_write", evaluation=evaluation, reason=reason
+                ):
+                    record["checkpoint_saved"] = self._write_hact_checkpoint(
+                        self.recorder.hact_chkfile, solver, result, energy,
+                        coords_bohr, key, evaluation,
+                    )
 
         if relax_active:
             self.cache[key] = energy
+        record["wall_seconds"] = round(time.time() - started, 6)
+        self.recorder.evaluation(record)
         print("# %-26s E=% .12f Ha" % (reason, energy), flush=True)
         gc.collect()
         return energy

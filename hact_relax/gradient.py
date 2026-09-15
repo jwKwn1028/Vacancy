@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Sequence
 
@@ -10,13 +11,26 @@ from hact_relax.geometry import write_xyz
 from hact_relax.surface import ActiveHamiltonianSurface
 
 
+def point_count_per_gradient(movable, axes, mode: str) -> int:
+    per_axis = 2 if mode == "central" else 1
+    return 1 + per_axis * len(tuple(axes)) * len(tuple(movable))
+
+
 class TrajectoryRecorder:
 
     def __init__(self, output_dir: Path, labels: Sequence[str]):
         self.labels = list(labels)
         self.xyz_path = output_dir / "trajectory.xyz"
+        self.jsonl_path = output_dir / "trajectory.jsonl"
+        self.npz_path = output_dir / "trajectory.npz"
         self.gradient_path = output_dir / "gradient_trajectory.npy"
+        self.coordinates: list[np.ndarray] = []
+        self.energies: list[float] = []
         self.gradients: list[np.ndarray] = []
+
+    @property
+    def calls(self) -> int:
+        return len(self.energies)
 
     def record(
         self,
@@ -25,8 +39,13 @@ class TrajectoryRecorder:
         energy: float,
         gradient: np.ndarray,
     ) -> None:
-        gradient = np.asarray(gradient, dtype=float).reshape(len(self.labels), 3)
+        natm = len(self.labels)
+        coords_bohr = np.asarray(coords_bohr, dtype=float).reshape(natm, 3)
+        gradient = np.asarray(gradient, dtype=float).reshape(natm, 3)
+        self.coordinates.append(coords_bohr.copy())
+        self.energies.append(float(energy))
         self.gradients.append(gradient.copy())
+
         write_xyz(
             self.xyz_path,
             self.labels,
@@ -35,7 +54,22 @@ class TrajectoryRecorder:
             % (call, energy, np.linalg.norm(gradient)),
             append=True,
         )
+        with self.jsonl_path.open("a") as handle:
+            handle.write(json.dumps({
+                "gradient_call": int(call),
+                "coordinates_bohr": coords_bohr.tolist(),
+                "energy_hartree": float(energy),
+                "gradient_hartree_per_bohr": gradient.tolist(),
+                "partial": False,
+            }, sort_keys=True) + "\n")
         np.save(self.gradient_path, np.stack(self.gradients))
+        np.savez(
+            self.npz_path,
+            labels=np.asarray(self.labels),
+            coordinates_bohr=np.stack(self.coordinates),
+            energies_hartree=np.asarray(self.energies),
+            gradients_hartree_per_bohr=np.stack(self.gradients),
+        )
 
 
 class FiniteDifferenceScanner:
@@ -70,8 +104,7 @@ class FiniteDifferenceScanner:
 
     @property
     def point_count_per_gradient(self) -> int:
-        per_axis = 2 if self.mode == "central" else 1
-        return 1 + per_axis * len(self.axes) * len(self.movable)
+        return point_count_per_gradient(self.movable, self.axes, self.mode)
 
     def _check_branch(self, displaced: float, center: float, label: str) -> None:
         implied = abs(float(displaced) - float(center)) / self.step_bohr

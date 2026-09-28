@@ -177,6 +177,7 @@ def run_configuration(
         "convergence_dmax": float(args.convergence_dmax),
         "tmax": float(args.tmax),
         "single_point": bool(args.single_point),
+        "energy_only": bool(getattr(args, "energy_only", False)),
         "allow_unconverged_geometry": bool(args.allow_unconverged_geometry),
         "checkpoint_eri": not bool(getattr(args, "no_eri_checkpoint", False)),
         "memory_mb": int(args.memory_mb),
@@ -298,6 +299,7 @@ def run_one(
         run_configuration(
             args, case_name, fragment, labels, vacancy_index, movable,
             output_dir, input_description, wrap_bond_ang,
+            1 if getattr(args, "energy_only", False) else
             point_count_per_gradient(movable, args.fd_axis_indices, args.fd_mode),
         ),
         resource_interval_seconds=float(
@@ -311,9 +313,13 @@ def run_one(
         full_chain_lattice(chain_cells, args.lattice_r, args.vacuum),
         recorder=recorder,
     )
+    # --energy-only: hand the scanner no movable atoms, so one call evaluates the
+    # centre and skips every displaced point.  Doing it here rather than with a
+    # branch below keeps last_energy/last_coords/last_gradient populated, so
+    # final.xyz, the trajectory and the summary are written exactly as usual.
     scanner = scanner_type(
         surface,
-        movable,
+        () if getattr(args, "energy_only", False) else movable,
         args.fd_step,
         args.max_gradient,
         axes=args.fd_axis_indices,

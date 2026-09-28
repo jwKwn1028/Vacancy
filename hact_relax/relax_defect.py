@@ -107,6 +107,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tmax", type=float, default=0.15)
     parser.add_argument("--allow-unconverged-geometry", action="store_true")
     parser.add_argument("--single-point", action="store_true")
+    parser.add_argument("--energy-only", action="store_true",
+                        help="with --single-point, evaluate only the centre and "
+                             "skip the finite-difference displacements.  The "
+                             "reported gradient is then zero, not converged")
 
     parser.add_argument("--resource-interval", type=float, default=30.0)
     parser.add_argument("--no-eri-checkpoint", action="store_true")
@@ -126,6 +130,8 @@ def validate_args(parser: argparse.ArgumentParser, args):
         parser.error(str(exc))
     if args.threads != THREADS:
         parser.error("--threads must be parsed before NumPy; pass it once")
+    if args.energy_only and not args.single_point:
+        parser.error("--energy-only only makes sense with --single-point")
     if args.memory_mb < 1 or args.fd_step <= 0 or args.maxsteps < 1:
         parser.error("--memory-mb, --fd-step and --maxsteps must be positive")
     if args.max_gradient <= 0.0 or args.bath_tol <= 0.0:

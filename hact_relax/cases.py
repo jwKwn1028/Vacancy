@@ -18,11 +18,10 @@ class VacancyCase:
     charge: int
     spin: int
     seed_vacancy: bool
-    # CAS window for --state excited.  The Schmidt step produces the EMBEDDING
-    # active space (tens of orbitals); CASCI runs in a smaller frontier window cut
-    # inside it, placed at orbitals [ncore, ncore + ncas) of the Fock-energy-sorted
-    # active orbitals, with ncore = (n_active_elec - ncas_elec) // 2.  The window
-    # SIZE is a property of the defect, not of the embedding, so it lives here.
+    # CAS window for --state excited, cut inside the (much larger) embedding
+    # active space and built from the orbitals most localized on the vacancy.
+    # ncas_elec fixes how many of them are occupied.  The window SIZE is a
+    # property of the defect, not of the embedding, so it lives here.
     ncas: int
     ncas_elec: int
     level_shift: float

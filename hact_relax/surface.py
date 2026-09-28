@@ -71,6 +71,9 @@ class SurfaceSettings:
     ncas_elec: int = 0
     casci_two_s: int | None = None
     min_casci_root_overlap: float = 0.5
+    cas_weight_gap_tol: float = 1e-3
+    cas_weight_floor: float = 0.1
+    allow_degenerate_cas: bool = False
 
 
 class ActiveHamiltonianSurface:
@@ -660,6 +663,9 @@ class ActiveHamiltonianSurface:
                     root=settings.root,
                     nroots=settings.nroots,
                     reference=self.casci_reference,
+                    cas_weight_gap_tol=settings.cas_weight_gap_tol,
+                    cas_weight_floor=settings.cas_weight_floor,
+                    allow_degenerate_cas=settings.allow_degenerate_cas,
                 )
             selected_overlap = (
                 None if self.casci_reference is None
@@ -681,12 +687,19 @@ class ActiveHamiltonianSurface:
                 "root_overlaps": casci.root_overlaps.tolist(),
                 "selected_root_overlap": selected_overlap,
                 "cas_orbital_min_overlap": casci.orbital_min_overlap,
+                "cas_window_min_overlap": casci.cas_window_min_overlap,
+                "cas_orbital_subspace_singular_values": (
+                    None if casci.orbital_subspace_singular_values is None
+                    else casci.orbital_subspace_singular_values.tolist()
+                ),
+                **(casci.selection or {}),
             })
 
-            # Guard 1 -- the active orbitals must still be the same frame, or the
-            # CI vectors being compared are not comparable.
-            if (casci.orbital_min_overlap is not None
-                    and casci.orbital_min_overlap
+            # Guard 1 -- the CAS window must still be the same frame, or the CI
+            # vectors being compared are not comparable.  Tested on the window
+            # rather than on the whole active space, which drifts with the bath.
+            if (casci.cas_window_min_overlap is not None
+                    and casci.cas_window_min_overlap
                     < settings.min_subspace_overlap):
                 self.recorder.evaluation({
                     **record,
@@ -695,8 +708,11 @@ class ActiveHamiltonianSurface:
                     "wall_seconds": round(time.time() - started, 6),
                 })
                 raise SubspaceContinuityError(
-                    "minimum tracked active-orbital overlap %.6f is below %.6f"
-                    % (casci.orbital_min_overlap, settings.min_subspace_overlap),
+                    "minimum tracked CAS-window orbital overlap %.6f is below "
+                    "%.6f (whole active space: %.6f)"
+                    % (casci.cas_window_min_overlap,
+                       settings.min_subspace_overlap,
+                       casci.orbital_min_overlap),
                     continuity_space="casci-active-orbitals",
                 )
             # Guard 2 -- some root must still carry the tracked state.
@@ -751,6 +767,16 @@ class ActiveHamiltonianSurface:
                     cell=solver.scell,
                     ordered_active_coeff=casci.ordered_active_coeff.copy(),
                     ci_vector=casci.ci_vectors[casci.selected_root].copy(),
+                    ncore=int(casci.ncore),
+                    ncas=int(settings.ncas),
+                    ncas_elec=int(settings.ncas_elec),
+                    two_s=int(self.case.spin if settings.casci_two_s is None
+                              else settings.casci_two_s),
+                    cas_indices=(
+                        self.casci_reference.cas_indices
+                        if self.casci_reference is not None
+                        else (casci.selection or {}).get("cas_indices")
+                    ),
                 )
             if self.fixed_n_bath is None:
                 self.fixed_n_bath = int(solver.n_bath)

@@ -74,6 +74,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-casci-root-overlap", type=float, default=0.5,
                         help="abort if no CASCI root overlaps the tracked state "
                              "by this much")
+    parser.add_argument("--cas-weight-gap-tol", type=float, default=1e-3,
+                        help="minimum relative gap in vacancy weight between the "
+                             "least local CAS orbital and the most local one "
+                             "left out.  Below this the cut runs through a "
+                             "degenerate set and the CAS would break the "
+                             "symmetry of the model")
+    parser.add_argument("--cas-weight-floor", type=float, default=0.1,
+                        help="a selected CAS orbital must carry at least this "
+                             "Mulliken population on the vacancy site.  Zero "
+                             "disables the check, which is the escape hatch for "
+                             "a defect whose localized states all sit in one "
+                             "manifold")
+    parser.add_argument("--allow-degenerate-cas", action="store_true",
+                        help="warn instead of aborting when the vacancy-local "
+                             "CAS cuts through a degenerate set")
 
     parser.add_argument("--fd-step", type=float, default=1e-3)
     parser.add_argument("--fd-axes", default="x")
@@ -125,6 +140,10 @@ def validate_args(parser: argparse.ArgumentParser, args):
         parser.error("--nroots must be positive")
     if not 0.0 <= args.min_casci_root_overlap <= 1.0:
         parser.error("--min-casci-root-overlap must be between zero and one")
+    if args.cas_weight_gap_tol <= 0.0:
+        parser.error("--cas-weight-gap-tol must be positive")
+    if args.cas_weight_floor < 0.0:
+        parser.error("--cas-weight-floor must not be negative")
     if (args.state != "ground"
             and args.min_center_subspace_overlap < args.min_subspace_overlap):
         print("# warning: --min-center-subspace-overlap (%g) is below "

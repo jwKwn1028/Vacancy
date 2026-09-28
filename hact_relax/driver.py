@@ -102,8 +102,16 @@ def run_configuration(
             "requested energy root initially, maximum CI overlap thereafter"
         ),
         "casci_cas_window_policy": (
-            "Fock-energy-sorted active orbitals [ncore, ncore + ncas), "
-            "ncore = (n_active_elec - ncas_elec) // 2"
+            "vacancy-local: the ncas active orbitals with the largest Mulliken "
+            "population on the vacancy site, chosen separately among the "
+            "doubly occupied and the empty orbitals so the CAS holds exactly "
+            "ncas_elec electrons, latched at the first accepted centre and "
+            "carried by maximum overlap thereafter"
+        ),
+        "cas_weight_gap_tol": float(getattr(args, "cas_weight_gap_tol", 1e-3)),
+        "cas_weight_floor": float(getattr(args, "cas_weight_floor", 0.1)),
+        "allow_degenerate_cas": bool(
+            getattr(args, "allow_degenerate_cas", False)
         ),
         "basis": args.basis,
         "auxbasis": None,
@@ -263,6 +271,9 @@ def run_one(
         min_casci_root_overlap=float(
             getattr(args, "min_casci_root_overlap", 0.5)
         ),
+        cas_weight_gap_tol=float(getattr(args, "cas_weight_gap_tol", 1e-3)),
+        cas_weight_floor=float(getattr(args, "cas_weight_floor", 0.1)),
+        allow_degenerate_cas=bool(getattr(args, "allow_degenerate_cas", False)),
     )
     driver_mol = build_driver_molecule(
         labels, coords_bohr, case, args.basis, args.memory_mb, args.verbose

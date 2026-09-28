@@ -409,6 +409,20 @@ class _SchmidtEmbedding:
         n_total_vac = self.scell.nelectron - self._vac_charge_sum() - self.charge
         return int(round(n_total_vac - n_core))
 
+    def vacancy_populations(self, c_act):
+        """Per-orbital Mulliken population on the vacancy site(s).
+
+        ``c_act`` is an AO-basis coefficient matrix and the result holds one
+        weight per column.  Unlike the private helper this refuses a solver with
+        no vacancy, rather than returning zeros a caller could rank.
+        """
+        if not self.vac_idx_sc:
+            raise RuntimeError(
+                "vacancy populations are undefined: this solver carries no "
+                "vacancy site, so no orbital can be scored by locality on it"
+            )
+        return self._vacancy_populations(c_act)
+
     def _vacancy_populations(self, c_act):
         c_act = np.asarray(c_act).real
         SC = self.S @ c_act

@@ -264,11 +264,22 @@ def make_pristine_reference(kmf) -> PristineReference:
 
 @dataclass
 class CASCIReference:
-    """The tracked state at the last accepted centre."""
+    """The tracked state at the last accepted centre.
+
+    ``ordered_active_coeff`` is stored in the order the first centre chose, so
+    the Hungarian match reproduces that window later without re-scoring
+    locality; the window definition is latched alongside it so a shift in the
+    active electron count cannot slide the CAS inside that ordering.
+    """
 
     cell: object
     ordered_active_coeff: np.ndarray
     ci_vector: np.ndarray
+    ncore: int
+    ncas: int
+    ncas_elec: int
+    two_s: int
+    cas_indices: list[int] | None = None
 
 
 @dataclass
@@ -288,6 +299,8 @@ class CASCIResult:
     ordered_active_coeff: np.ndarray | None
     orbital_min_overlap: float | None
     orbital_subspace_singular_values: np.ndarray | None = None
+    cas_window_min_overlap: float | None = None
+    selection: dict | None = None
 
 
 def _normalized_ci_overlaps(
@@ -313,6 +326,224 @@ def _normalized_ci_overlaps(
     return np.asarray(values, dtype=float)
 
 
+def _split_by_weight(indices, weights, n_take):
+    """The ``n_take`` most vacancy-local members of ``indices``, and the rest.
+
+    Ties break by ascending orbital index, so the split is reproducible.
+    """
+    indices = np.asarray(indices, dtype=int)
+    ranked = indices[np.lexsort((indices, -np.asarray(weights)[indices]))]
+    return ranked[:n_take], ranked[n_take:]
+
+
+def _weight_gap(kept, dropped, weights):
+    weights = np.asarray(weights)
+    kept_min = float(np.min(weights[kept])) if kept.size else None
+    dropped_max = float(np.max(weights[dropped])) if dropped.size else None
+    if kept_min is None or dropped_max is None:
+        return kept_min, dropped_max, None
+    return kept_min, dropped_max, float(
+        (kept_min - dropped_max) / max(abs(kept_min), 1e-12)
+    )
+
+
+def _degenerate_cut_message(name, kept, dropped, weights, ratio, gap_tol,
+                            ncas, ncas_elec, occupied):
+    weights = np.asarray(weights)
+    kept_min = float(np.min(weights[kept]))
+    tied_kept = int(np.sum(weights[kept] <= kept_min * (1.0 + gap_tol)))
+    tied_dropped = int(np.sum(
+        weights[dropped] >= kept_min * (1.0 - gap_tol)
+    ))
+    if occupied:
+        remedy = (
+            "use --ncas %d --ncas-elec %d to drop the whole tied set, or "
+            "--ncas %d --ncas-elec %d to keep all of it"
+            % (ncas - tied_kept, ncas_elec - 2 * tied_kept,
+               ncas + tied_dropped, ncas_elec + 2 * tied_dropped)
+        )
+    else:
+        remedy = (
+            "use --ncas %d to drop the whole tied set, or --ncas %d to keep "
+            "all of it" % (ncas - tied_kept, ncas + tied_dropped)
+        )
+    return (
+        "the vacancy-local CAS cuts through a degenerate set of %s orbitals: "
+        "the least local orbital kept has weight %.6e, the most local one "
+        "dropped has %.6e, a relative gap of %.3e below the %.3e tolerance.  "
+        "Splitting a degenerate set breaks the symmetry of the model (the "
+        "transverse p orbitals on the vacancy site are exactly degenerate on a "
+        "linear chain), so %d kept and %d dropped orbitals are being separated "
+        "arbitrarily.  Either %s, or pass --allow-degenerate-cas to accept the "
+        "split"
+        % (name, kept_min, float(np.max(weights[dropped])), ratio, gap_tol,
+           tied_kept, tied_dropped, remedy)
+    )
+
+
+def select_vacancy_local_cas(
+    weights,
+    occupations,
+    orbital_energy,
+    *,
+    ncas: int,
+    ncas_elec: int,
+    ncore: int,
+    gap_tol: float = 1e-3,
+    weight_floor: float = 0.1,
+    allow_degenerate: bool = False,
+) -> tuple[np.ndarray, dict]:
+    """Order H_act^V so the CAS is the most vacancy-local orbitals.
+
+    Returns a full ``nact`` permutation ``core + cas + virtual``, so the CAS
+    lands in ``[ncore, ncore + ncas)`` where PySCF expects it, plus a
+    diagnostics dict.  The most local orbitals are taken separately within the
+    occupied and the empty manifolds, which fixes the CAS electron count by
+    construction.  ``orbital_energy`` only orders the interiors of the core and
+    virtual blocks and cannot affect the energy.
+    """
+    weights = np.asarray(weights, dtype=float)
+    occupations = np.asarray(occupations, dtype=float)
+    orbital_energy = np.asarray(orbital_energy, dtype=float)
+    nact = weights.size
+    if occupations.size != nact or orbital_energy.size != nact:
+        raise ValueError(
+            "vacancy weights, occupations and orbital energies must all span "
+            "the active space: got %d, %d, %d"
+            % (nact, occupations.size, orbital_energy.size)
+        )
+
+    double = np.flatnonzero(occupations > 1.5)
+    single = np.flatnonzero((occupations > 0.5) & (occupations <= 1.5))
+    empty = np.flatnonzero(occupations <= 0.5)
+    if double.size + single.size + empty.size != nact:
+        raise RuntimeError("active occupations are not near 0, 1 or 2")
+
+    # Every open shell must sit inside the CAS; outside it an orbital is either
+    # doubly occupied or dropped.
+    n_cas_single = int(single.size)
+    if n_cas_single > ncas:
+        raise ValueError(
+            "CAS(%de,%do) is too small for this reference: %d singly occupied "
+            "active orbitals must all sit inside the CAS"
+            % (ncas_elec, ncas, n_cas_single)
+        )
+    remainder = int(ncas_elec) - n_cas_single
+    if remainder < 0 or remainder % 2:
+        raise ValueError(
+            "%d CAS electrons cannot fill %d singly occupied orbitals plus "
+            "doubly occupied ones: %d electrons are left over"
+            % (ncas_elec, n_cas_single, remainder)
+        )
+    n_cas_double = remainder // 2
+    n_cas_empty = int(ncas) - n_cas_single - n_cas_double
+    if n_cas_double > double.size:
+        raise ValueError(
+            "CAS(%de,%do) needs %d doubly occupied orbitals but the active "
+            "space has only %d" % (ncas_elec, ncas, n_cas_double, double.size)
+        )
+    if n_cas_empty < 0:
+        raise ValueError(
+            "CAS(%de,%do) cannot hold %d electrons in %d orbitals once the %d "
+            "open shells are placed" % (ncas_elec, ncas, ncas_elec, ncas,
+                                        n_cas_single)
+        )
+    if n_cas_empty > empty.size:
+        raise ValueError(
+            "CAS(%de,%do) needs %d empty orbitals but the active space has "
+            "only %d" % (ncas_elec, ncas, n_cas_empty, empty.size)
+        )
+
+    cas_double, core = _split_by_weight(double, weights, n_cas_double)
+    cas_empty, virtual = _split_by_weight(empty, weights, n_cas_empty)
+    if core.size != ncore:
+        raise RuntimeError(
+            "vacancy-local selection left %d doubly occupied orbitals outside "
+            "the CAS but ncore is %d: the active occupations disagree with the "
+            "active electron count" % (core.size, ncore)
+        )
+
+    cas = np.concatenate([
+        cas_double,
+        single[np.lexsort((single, -weights[single]))],
+        cas_empty,
+    ]).astype(int)
+    order = np.concatenate([
+        core[np.argsort(orbital_energy[core])],
+        cas,
+        virtual[np.argsort(orbital_energy[virtual])],
+    ]).astype(int)
+    if not np.array_equal(np.sort(order), np.arange(nact)):
+        raise RuntimeError("vacancy-local selection did not return a permutation")
+
+    occ_min, occ_max, occ_ratio = _weight_gap(cas_double, core, weights)
+    empty_min, empty_max, empty_ratio = _weight_gap(cas_empty, virtual, weights)
+    ratios = [r for r in (occ_ratio, empty_ratio) if r is not None]
+    diagnostics = {
+        "cas_selection": "vacancy-local",
+        "cas_indices": [int(i) for i in cas],
+        "cas_occupied_count": n_cas_double,
+        "cas_open_shell_count": n_cas_single,
+        "cas_empty_count": n_cas_empty,
+        "cas_vacancy_weights": [float(w) for w in weights],
+        "cas_weight_occupied_kept_min": occ_min,
+        "cas_weight_occupied_dropped_max": occ_max,
+        "cas_weight_empty_kept_min": empty_min,
+        "cas_weight_empty_dropped_max": empty_max,
+        "cas_weight_cut_ratio": (min(ratios) if ratios else None),
+        "cas_weight_gap_tol": float(gap_tol),
+        "cas_weight_floor": float(weight_floor),
+        "cas_degenerate_cut": False,
+    }
+
+    # The gap below is scale free, so only an absolute floor can tell a clean
+    # split from a split through numerical noise.
+    for name, kept, manifold, occupied in (
+        ("occupied", cas_double, double, True),
+        ("empty", cas_empty, empty, False),
+    ):
+        if not kept.size or weight_floor <= 0.0:
+            continue
+        worst = float(np.min(weights[kept]))
+        if worst >= weight_floor:
+            continue
+        clearing = int(np.sum(weights[manifold] >= weight_floor))
+        if occupied:
+            remedy = "--ncas-elec %d" % (2 * clearing + n_cas_single)
+        else:
+            remedy = "--ncas %d" % (n_cas_single + n_cas_double + clearing)
+        raise ValueError(
+            "the CAS is not vacancy-local: only %d of the %d %s active "
+            "orbitals carry a vacancy population above the %.3e floor, but the "
+            "CAS asks for %d of them, and the least local one selected has "
+            "%.3e.  Those orbitals are being ranked out of numerical noise "
+            "rather than by locality.  Either use %s so the CAS takes only the "
+            "orbitals that clear the floor, widen the locality measure beyond "
+            "the vacancy site itself (the first coordination shell carries the "
+            "dangling bonds), or pass --cas-weight-floor 0 to accept the "
+            "ordering as it stands"
+            % (clearing, manifold.size, name, weight_floor, kept.size, worst,
+               remedy)
+        )
+
+    for name, kept, dropped, ratio, occupied in (
+        ("occupied", cas_double, core, occ_ratio, True),
+        ("empty", cas_empty, virtual, empty_ratio, False),
+    ):
+        if ratio is None or ratio >= gap_tol:
+            continue
+        diagnostics["cas_degenerate_cut"] = True
+        message = _degenerate_cut_message(
+            name, kept, dropped, weights, ratio, gap_tol, ncas, ncas_elec,
+            occupied,
+        )
+        if not allow_degenerate:
+            raise ValueError(message)
+        print("# warning: %s" % message, flush=True)
+
+    return order, diagnostics
+
+
 def casci_energy(
     solver,
     result,
@@ -323,63 +554,16 @@ def casci_energy(
     root: int,
     nroots: int,
     reference: CASCIReference | None = None,
+    cas_weight_gap_tol: float = 1e-3,
+    cas_weight_floor: float = 0.1,
+    allow_degenerate_cas: bool = False,
 ) -> CASCIResult:
-    """CASCI on ``H_act^V`` with maximum-overlap orbital/root tracking."""
+    """CASCI on ``H_act^V`` with a vacancy-local CAS and root tracking."""
     h1e = np.asarray(result[5]).real
     eri = np.asarray(result[6]).real
     orbital_energy = np.asarray(result[2]).real
     active_coeff = None if result[3] is None else np.asarray(result[3]).real
-
-    orbital_min_overlap = None
-    orbital_subspace_singular_values = None
-    if reference is None:
-        # Without a reference the CAS window is placed by Fock energy.  The
-        # relax_active=False path returns zeros for result[2], so ordering would
-        # silently degenerate into "by index" -- refuse instead.  A semi-analytic
-        # displaced point always has an accepted centre, so this cannot fire
-        # there; it fires only if a frozen evaluation is ever reached first.
-        if orbital_energy.size and np.ptp(orbital_energy) == 0.0:
-            raise RuntimeError(
-                "CASCI cannot order the active space: the orbital energies are "
-                "all equal, so no frontier window can be identified.  This "
-                "happens on a frozen (relax_active=False) evaluation reached "
-                "without an accepted centre."
-            )
-        order = np.argsort(orbital_energy)
-        signs = np.ones(order.size)
-    else:
-        if (active_coeff is None
-                or active_coeff.shape != reference.ordered_active_coeff.shape):
-            raise RuntimeError(
-                "CASCI active-orbital dimension changed during root tracking"
-            )
-        match = match_orbital_subspaces(
-            reference.cell,
-            reference.ordered_active_coeff,
-            solver.scell,
-            active_coeff,
-            target_overlap=getattr(solver, "S", None),
-        )
-        overlap = np.asarray(match.overlap).real
-        rows, columns = linear_sum_assignment(-np.abs(overlap))
-        order = columns[np.argsort(rows)]
-        matched = overlap[np.arange(order.size), order]
-        signs = np.where(matched < 0.0, -1.0, 1.0)
-        orbital_min_overlap = float(np.min(np.abs(matched))) if matched.size else 1.0
-        orbital_subspace_singular_values = match.singular_values.copy()
-
-    h1e = h1e[np.ix_(order, order)]
-    eri = eri[np.ix_(order, order, order, order)]
-    h1e = h1e * (signs[:, None] * signs[None, :])
-    eri = eri * (
-        signs[:, None, None, None]
-        * signs[None, :, None, None]
-        * signs[None, None, :, None]
-        * signs[None, None, None, :]
-    )
-    ordered_active_coeff = (
-        None if active_coeff is None else active_coeff[:, order] * signs[None, :]
-    )
+    active_occ = np.asarray(result[4]).real
 
     active_electrons = (
         int(sum(solver.nelecas)) if np.ndim(solver.nelecas) else int(solver.nelecas)
@@ -396,6 +580,80 @@ def casci_energy(
             "CAS(%de,%do) does not fit H_act^V: active_electrons=%d, nact=%d, "
             "ncore=%d" % (ncas_elec, ncas, active_electrons, nact, ncore)
         )
+
+    orbital_min_overlap = None
+    cas_window_min_overlap = None
+    orbital_subspace_singular_values = None
+    selection = None
+    if reference is None:
+        # First accepted centre: cut the window by locality on the vacancy.
+        # Later geometries inherit this ordering through the Hungarian match.
+        if active_coeff is None:
+            raise RuntimeError(
+                "the vacancy-local CAS needs the active orbitals, but this "
+                "evaluation returned none"
+            )
+        order, selection = select_vacancy_local_cas(
+            solver.vacancy_populations(active_coeff),
+            active_occ,
+            orbital_energy,
+            ncas=ncas,
+            ncas_elec=ncas_elec,
+            ncore=ncore,
+            gap_tol=cas_weight_gap_tol,
+            weight_floor=cas_weight_floor,
+            allow_degenerate=allow_degenerate_cas,
+        )
+        signs = np.ones(order.size)
+    else:
+        if (active_coeff is None
+                or active_coeff.shape != reference.ordered_active_coeff.shape):
+            raise RuntimeError(
+                "CASCI active-orbital dimension changed during root tracking"
+            )
+        if ((reference.ncore, reference.ncas, reference.ncas_elec,
+             reference.two_s) != (ncore, ncas, ncas_elec, two_s)):
+            raise RuntimeError(
+                "the CAS definition changed after it was latched: the first "
+                "accepted centre fixed CAS(%de,%do) with ncore=%d and 2S=%d, "
+                "this evaluation asks for CAS(%de,%do) with ncore=%d and "
+                "2S=%d.  A vacancy-local window is chosen once and carried by "
+                "overlap, so it cannot follow a change of size, electron count "
+                "or spin sector"
+                % (reference.ncas_elec, reference.ncas, reference.ncore,
+                   reference.two_s, ncas_elec, ncas, ncore, two_s)
+            )
+        match = match_orbital_subspaces(
+            reference.cell,
+            reference.ordered_active_coeff,
+            solver.scell,
+            active_coeff,
+            target_overlap=getattr(solver, "S", None),
+        )
+        overlap = np.asarray(match.overlap).real
+        rows, columns = linear_sum_assignment(-np.abs(overlap))
+        order = columns[np.argsort(rows)]
+        matched = overlap[np.arange(order.size), order]
+        signs = np.where(matched < 0.0, -1.0, 1.0)
+        orbital_min_overlap = float(np.min(np.abs(matched))) if matched.size else 1.0
+        # The CAS window is the subspace the CI vector lives in; guard on that
+        # rather than on the whole active space.
+        window = np.abs(matched[ncore:ncore + ncas])
+        cas_window_min_overlap = float(np.min(window)) if window.size else 1.0
+        orbital_subspace_singular_values = match.singular_values.copy()
+
+    h1e = h1e[np.ix_(order, order)]
+    eri = eri[np.ix_(order, order, order, order)]
+    h1e = h1e * (signs[:, None] * signs[None, :])
+    eri = eri * (
+        signs[:, None, None, None]
+        * signs[None, :, None, None]
+        * signs[None, None, :, None]
+        * signs[None, None, None, :]
+    )
+    ordered_active_coeff = (
+        None if active_coeff is None else active_coeff[:, order] * signs[None, :]
+    )
 
     ecore = float(solver.E1e_core + solver.E2e_core + solver.Enuc)
     fake_mf = _fake_mf(h1e, eri, ecore, active_electrons)
@@ -439,6 +697,8 @@ def casci_energy(
         requested_root=int(root),
         selected_root=selected_root,
         root_overlaps=root_overlaps,
+        cas_window_min_overlap=cas_window_min_overlap,
+        selection=selection,
         ordered_active_coeff=ordered_active_coeff,
         orbital_min_overlap=orbital_min_overlap,
         orbital_subspace_singular_values=orbital_subspace_singular_values,

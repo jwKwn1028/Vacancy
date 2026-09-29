@@ -23,7 +23,7 @@ class _SchmidtEmbedding:
 
     def _configure(self, kmf, kmesh, *, vac_species, n_frag, charge=0,
                    minao="minao", bath_tol=1e-8, max_cycle=200, level_shift=0.0,
-                   verbose=0, defect=True, eri_mode="periodic",
+                   verbose=0, defect=True, eri_mode="cluster",
                    seed_vacancy=False, vacancy_index=None,
                    fixed_n_bath=None, fixed_fragment_atoms=None,
                    compute_core_energy=True, auxbasis=None):

@@ -14,6 +14,9 @@ from .frozen_rhf import Frozen_RHF
 from .frozen_rohf import Frozen_ROHF
 
 
+DEFAULT_BATH_TOL = 2e-11
+
+
 def _sq(x):
     x = np.asarray(x)
     return x[0] if x.ndim == 3 else x
@@ -22,7 +25,8 @@ def _sq(x):
 class _SchmidtEmbedding:
 
     def _configure(self, kmf, kmesh, *, vac_species, n_frag, charge=0,
-                   minao="minao", bath_tol=1e-8, max_cycle=200, level_shift=0.0,
+                   minao="minao", bath_tol=DEFAULT_BATH_TOL, max_cycle=200,
+                   level_shift=0.0,
                    verbose=0, defect=True, eri_mode="cluster",
                    seed_vacancy=False, vacancy_index=None,
                    fixed_n_bath=None, fixed_fragment_atoms=None,

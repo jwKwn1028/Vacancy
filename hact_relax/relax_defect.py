@@ -15,6 +15,7 @@ from hact_relax._bootstrap import REPO, THREADS
 
 from pyscf import lib
 
+from frozen_bath_scf.schmidt_embedding import DEFAULT_BATH_TOL
 from hact_relax.cases import (
     CASES,
     CHAIN_CELLS,
@@ -42,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--coordsys", default="cart",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
 
-    parser.add_argument("--bath-tol", type=float, default=1e-6)
+    parser.add_argument("--bath-tol", type=float, default=DEFAULT_BATH_TOL)
     parser.add_argument("--scf-max-cycle", type=int, default=200)
     parser.add_argument("--scf-conv-tol", type=float, default=1e-9)
     parser.add_argument("--scf-conv-tol-grad", type=float, default=1e-6)

@@ -75,6 +75,7 @@ class Frozen_RHF(FrozenActiveSpace, hf.SCF):
 
         if scf_conv:
             mo_energy, U = self.eig(fock, eye)
+            mo_coeff = lib.einsum("ui, ij -> uj", mo_coeff, U)
             mo_occ = self.get_occ(mo_energy, mo_coeff)
 
             h1e = self.get_hcore(h1e, U)

@@ -120,8 +120,95 @@ class _SchmidtEmbedding:
             )
         return np.asarray(hcore).real
 
+    def _kmesh_periodic_gdf(self, scell):
+        """The supercell GDF on a k-mesh: only periodic ERIs need one."""
+        reused = getattr(getattr(self.kmf, "with_df", None), "auxbasis", None)
+        if self.auxbasis is not None and reused != self.auxbasis:
+            raise ValueError(
+                "pristine KRHF was density-fitted with auxbasis=%r but the "
+                "embedding was given auxbasis=%r"
+                % (reused, self.auxbasis)
+            )
+        if self.eri_mode != "periodic":
+            return None
+        gdf = pdf.GDF(scell)
+        gdf.auxbasis = reused
+        gdf.build()
+        return gdf
+
+    def _kmesh_pristine_hcore(self):
+        """hcore at the KRHF's k-points, defined as on the Gamma route.
+
+        The KRHF's cached copy when it still matches its cell, else kin + get_nuc.
+        """
+        kmf = self.kmf
+        cell = kmf.cell
+        kpts = np.asarray(kmf.kpts)
+        ecpbas = getattr(cell, "_ecpbas", ())
+        all_electron = not getattr(cell, "pseudo", None) and not (
+            ecpbas is not None and len(ecpbas)
+        )
+        cache = getattr(kmf, "_embedding_pristine_hcore_cache", None)
+        if cache is not None and all_electron:
+            if not isinstance(cache, dict) or cache.get("version") != 1:
+                raise RuntimeError("unrecognized pristine hcore cache")
+            if (cache.get("cell") is not cell
+                    or cache.get("with_df") is not kmf.with_df):
+                raise RuntimeError(
+                    "pristine hcore cache belongs to a different mean field"
+                )
+            snapshots = (
+                ("k-points", cache.get("kpts"), kpts),
+                ("lattice", cache.get("lattice_vectors"), cell.lattice_vectors()),
+                ("coordinates", cache.get("atom_coords"), cell.atom_coords()),
+                ("nuclear charges", cache.get("atom_charges"), cell.atom_charges()),
+            )
+            for name, cached, current in snapshots:
+                if cached is None or not np.array_equal(
+                    np.asarray(cached), np.asarray(current)
+                ):
+                    raise RuntimeError("pristine hcore cache %s changed" % name)
+            hcore = np.asarray(cache.get("hcore"))
+            nao = int(cell.nao_nr())
+            if (hcore.shape != (len(kpts), nao, nao)
+                    or not np.all(np.isfinite(hcore))):
+                raise RuntimeError(
+                    "pristine hcore cache has invalid shape or non-finite values"
+                )
+            return hcore
+        kin = np.asarray(cell.pbc_intor("int1e_kin", hermi=1, kpts=kpts))
+        return kin + np.asarray(kmf.with_df.get_nuc(kpts))
+
+    def _kmesh_pristine_vhf(self):
+        """J - K/2 of the pristine density at the KRHF's k-points (exxdiv=None)."""
+        kmf = self.kmf
+        vj, vk = kmf.with_df.get_jk(
+            kmf.make_rdm1(), hermi=1, kpts=kmf.kpts, exxdiv=None
+        )
+        return np.asarray(vj) - 0.5 * np.asarray(vk)
+
+    def _unfold_kpoint_blocks(self, blocks):
+        """Supercell AO matrix of a lattice-periodic operator from its k blocks."""
+        matrix = k2gamma.to_supercell_ao_integrals(
+            self.kmf.cell, self.kmf.kpts, np.asarray(blocks), kmesh=self.kmesh,
+            force_real=False,
+        )
+        if np.abs(matrix.imag).max() > 1e-8:
+            raise RuntimeError(
+                "unfolded one-body matrix is not real (imaginary part %.1e); "
+                "the k-mesh must be Gamma-centred" % np.abs(matrix.imag).max()
+            )
+        return np.ascontiguousarray(matrix.real)
+
     def _build_supercell(self):
         gamma_full_cell = tuple(int(x) for x in self.kmesh) == (1, 1, 1)
+        if not gamma_full_cell:
+            nkpts = len(np.reshape(self.kmf.kpts, (-1, 3)))
+            if nkpts != int(np.prod(self.kmesh)):
+                raise ValueError(
+                    "kmesh %s does not match the %d k-points of the mean field"
+                    % (self.kmesh, nkpts)
+                )
         mf_sc = self.kmf if gamma_full_cell else k2gamma.k2gamma(
             self.kmf, kmesh=self.kmesh
         )
@@ -141,10 +228,15 @@ class _SchmidtEmbedding:
                 )
             if getattr(gdf, "_cderi", None) is None:
                 gdf.build()
-        else:
+        elif gamma_full_cell:
             gdf = pdf.GDF(scell)
             gdf.auxbasis = self.auxbasis
             gdf.build()
+        else:
+            # On a k-mesh the one-body terms below are unfolded from the k-point
+            # mean field, so they share the pristine energy's integrals and need
+            # no supercell GDF (docs/20).
+            gdf = self._kmesh_periodic_gdf(scell)
         self.gdf = gdf
 
         mo = _sq(mf_sc.mo_coeff).real
@@ -156,20 +248,26 @@ class _SchmidtEmbedding:
         orbocc = mo[:, occ > 0]
         self._orbocc = orbocc
 
-        cached_hcore = self._reusable_pristine_hcore(
-            scell, gdf, gamma_full_cell=gamma_full_cell
-        )
-        if cached_hcore is not None:
-            self.hcore = np.array(cached_hcore, copy=True).real
+        if gamma_full_cell:
+            cached_hcore = self._reusable_pristine_hcore(
+                scell, gdf, gamma_full_cell=gamma_full_cell
+            )
+            if cached_hcore is not None:
+                self.hcore = np.array(cached_hcore, copy=True).real
+            else:
+                kin = np.asarray(scell.pbc_intor("int1e_kin", hermi=1)).real
+                nuc = _sq(gdf.get_nuc()).real
+                self.hcore = kin + nuc
         else:
-            kin = np.asarray(scell.pbc_intor("int1e_kin", hermi=1)).real
-            nuc = _sq(gdf.get_nuc()).real
-            self.hcore = kin + nuc
+            self.hcore = self._unfold_kpoint_blocks(self._kmesh_pristine_hcore())
 
         dm = (orbocc * occ[occ > 0]) @ orbocc.T
         self._dm_ao = dm
-        vj, vk = gdf.get_jk(dm, hermi=1, exxdiv=None)
-        self.vhf = (_sq(vj) - 0.5 * _sq(vk)).real
+        if gamma_full_cell:
+            vj, vk = gdf.get_jk(dm, hermi=1, exxdiv=None)
+            self.vhf = (_sq(vj) - 0.5 * _sq(vk)).real
+        else:
+            self.vhf = self._unfold_kpoint_blocks(self._kmesh_pristine_vhf())
         self.Enuc_P = scell.energy_nuc() if self.compute_core_energy else None
 
     def _build_localized_orbitals(self):

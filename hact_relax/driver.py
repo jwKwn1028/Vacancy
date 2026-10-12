@@ -10,14 +10,25 @@ import numpy as np
 from pyscf.geomopt import geometric_solver
 from pyscf.geomopt.addons import as_pyscf_method
 
-from hact_relax.cases import CASES, FULL_CHAIN_KMESH, fragment_relax_radius
+from hact_relax.cases import (
+    CASES,
+    FULL_CHAIN_KMESH,
+    HBN2D,
+    HOST_DEFAULT_WRAP,
+    fragment_relax_radius,
+)
 from hact_relax.errors import GeometryOptimizationNotConverged
 from hact_relax.geometry import (
+    BOHR,
     build_driver_molecule,
+    build_hbn_starting_geometry,
     build_starting_geometry,
     check_geometry_fits_lattice,
+    check_geometry_fits_supercell,
+    fragment_movable_atoms,
     full_chain_lattice,
     ghost_species,
+    hbn_lattice,
     movable_atoms,
     patch_geometric_for_ghost_atoms,
     read_xyz,
@@ -59,6 +70,137 @@ def unique_output_dir(base: Path, stem: str) -> Path:
     return numbered
 
 
+def _cas_selection(args, case) -> str:
+    requested = getattr(args, "cas_selection", None)
+    return case.cas_selection if requested is None else str(requested)
+
+
+def _wrap_about_vacancy(args, case) -> bool:
+    requested = getattr(args, "wrap_about_vacancy", None)
+    return HOST_DEFAULT_WRAP[case.host] if requested is None else bool(requested)
+
+
+def _check_ghost_site(labels, vacancy_index, case, input_description) -> None:
+    parent_species = ghost_species(labels[vacancy_index])
+    if parent_species.lower() != case.vacancy.lower():
+        raise ValueError(
+            "%s contains %s at the ghost site, expected %s"
+            % (input_description, parent_species, case.vacancy)
+        )
+
+
+def _lih_geometry(args, case_name, fragment, input_xyz):
+    case = CASES[case_name]
+    chain_cells = int(args.chain_cells)
+    if input_xyz is None:
+        labels, coords_bohr, vacancy_index = build_starting_geometry(
+            case_name, chain_cells, args.lattice_r
+        )
+        input_description = "generated LiH-1D + central %s vacancy" % case.vacancy
+    else:
+        labels, coords_bohr, vacancy_index = read_xyz(input_xyz)
+        input_description = os.fspath(input_xyz)
+
+    _check_ghost_site(labels, vacancy_index, case, input_description)
+    expected_natm = 2 * chain_cells
+    if len(labels) != expected_natm:
+        raise ValueError(
+            "%s has %d atoms; a %d-cell full LiH chain requires %d atoms"
+            % (input_description, len(labels), chain_cells, expected_natm)
+        )
+    if fragment > expected_natm:
+        raise ValueError(
+            "fragment size %d exceeds the %d-atom full chain"
+            % (fragment, expected_natm)
+        )
+    wrap_bond_ang = check_geometry_fits_lattice(
+        coords_bohr, chain_cells, args.lattice_r, input_description
+    )
+
+    coords_bohr = seed_displace_from_vacancy(
+        coords_bohr, vacancy_index, args.seed_displace
+    )
+    movable = movable_atoms(
+        labels, coords_bohr, vacancy_index, fragment, args.lattice_r
+    )
+    chain_length = 2.0 * float(args.lattice_r) * chain_cells
+    fields = {
+        "chain_cells": chain_cells,
+        "primitive_cell_atoms": 2,
+        "full_chain_atoms": len(labels),
+        "full_chain_kmesh": list(FULL_CHAIN_KMESH),
+        "lattice_r_ang": float(args.lattice_r),
+        "chain_length_ang": chain_length,
+        "vacancy_image_separation_ang": chain_length,
+        "wrap_bond_ang": float(wrap_bond_ang),
+        "relax_radius_ang": fragment_relax_radius(fragment, args.lattice_r),
+        "relax_radius_policy": "fragment extent from N_Frag",
+        "relax_radius_request": "auto",
+        "pinned_chain_end_atoms_zero_based": [],
+        "full_chain_is_large_cell_scf": True,
+        "initial_uniform_geometry_primitive_kmesh": [chain_cells, 1, 1],
+        "periodic_scf": "pristine full-chain Gamma KRHF with the vacancy restored",
+    }
+    lattice_bohr = full_chain_lattice(chain_cells, args.lattice_r, args.vacuum)
+    return (labels, coords_bohr, vacancy_index, movable, input_description,
+            lattice_bohr, fields)
+
+
+def _hbn_geometry(args, case_name, fragment, input_xyz):
+    case = CASES[case_name]
+    ncells = int(args.hbn_cells)
+    lattice_bohr = hbn_lattice(ncells, args.hbn_a, args.vacuum)
+    if input_xyz is None:
+        labels, coords_bohr, vacancy_index = build_hbn_starting_geometry(
+            case_name, ncells, args.hbn_a, args.vacuum
+        )
+        input_description = (
+            "generated hBN-2D %dx%d + central %s vacancy"
+            % (ncells, ncells, case.vacancy)
+        )
+    else:
+        labels, coords_bohr, vacancy_index = read_xyz(input_xyz)
+        input_description = os.fspath(input_xyz)
+
+    _check_ghost_site(labels, vacancy_index, case, input_description)
+    expected_natm = 2 * ncells * ncells
+    if len(labels) != expected_natm:
+        raise ValueError(
+            "%s has %d atoms; a %dx%d hBN supercell has %d"
+            % (input_description, len(labels), ncells, ncells, expected_natm)
+        )
+    if fragment > expected_natm:
+        raise ValueError(
+            "fragment size %d exceeds the %d-atom supercell"
+            % (fragment, expected_natm)
+        )
+    if args.seed_displace != 0.0:
+        raise ValueError("--seed-displace is defined for the LiH chain only")
+    shortest_ang = check_geometry_fits_supercell(
+        coords_bohr, lattice_bohr, input_description
+    )
+    # Only the fragment's real atoms move; the ghost site keeps its basis where
+    # the boron was.
+    movable = fragment_movable_atoms(
+        labels, coords_bohr, lattice_bohr, vacancy_index, fragment
+    )
+    fields = {
+        "hbn_cells": ncells,
+        "primitive_cell_atoms": 2,
+        "supercell_atoms": len(labels),
+        "lattice_a_ang": float(args.hbn_a),
+        "vacancy_image_separation_ang": float(ncells * args.hbn_a),
+        "shortest_atom_distance_ang": float(shortest_ang),
+        "relax_policy": "real atoms of the fragment's complete shells",
+        "initial_uniform_geometry_primitive_kmesh": [ncells, ncells, 1],
+        "periodic_scf": "pristine supercell Gamma KRHF with the vacancy restored",
+        "lattice_bohr": np.asarray(lattice_bohr).tolist(),
+        "lattice_ang": (np.asarray(lattice_bohr) * BOHR).tolist(),
+    }
+    return (labels, coords_bohr, vacancy_index, movable, input_description,
+            lattice_bohr, fields)
+
+
 def run_configuration(
     args,
     case_name: str,
@@ -68,14 +210,14 @@ def run_configuration(
     movable,
     output_dir: Path,
     input_description: str,
-    wrap_bond_ang: float,
+    geometry_fields: dict,
     points_per_gradient: int,
 ) -> dict:
     case = CASES[case_name]
-    chain_cells = int(args.chain_cells)
-    chain_length = 2.0 * float(args.lattice_r) * chain_cells
     semi_analytic = bool(getattr(args, "semi_analytic_gradient", False))
+    cas_selection = _cas_selection(args, case)
     return {
+        "host": case.host,
         "case_name": case_name,
         "fragment": fragment,
         "state": str(getattr(args, "state", "ground")),
@@ -102,11 +244,20 @@ def run_configuration(
             "requested energy root initially, maximum CI overlap thereafter"
         ),
         "casci_cas_window_policy": (
+            "energy: the Fock-energy frontier, ncore orbitals below it doubly "
+            "occupied and every orbital above it empty, latched at the first "
+            "accepted centre and carried by maximum overlap thereafter"
+            if cas_selection == "energy" else
             "vacancy-local: the ncas active orbitals with the largest Mulliken "
             "population on the vacancy site, chosen separately among the "
             "doubly occupied and the empty orbitals so the CAS holds exactly "
             "ncas_elec electrons, latched at the first accepted centre and "
             "carried by maximum overlap thereafter"
+        ),
+        "cas_selection": cas_selection,
+        "wrap_about_vacancy": _wrap_about_vacancy(args, case),
+        "cas_energy_gap_tol_hartree": float(
+            getattr(args, "cas_energy_gap_tol", 1e-4)
         ),
         "cas_weight_gap_tol": float(getattr(args, "cas_weight_gap_tol", 1e-3)),
         "cas_weight_floor": float(getattr(args, "cas_weight_floor", 0.1)),
@@ -115,31 +266,17 @@ def run_configuration(
         ),
         "basis": args.basis,
         "auxbasis": None,
-        "chain_cells": chain_cells,
-        "primitive_cell_atoms": 2,
-        "full_chain_atoms": len(labels),
-        "full_chain_kmesh": list(FULL_CHAIN_KMESH),
+        **geometry_fields,
         "reference_kmesh": list(FULL_CHAIN_KMESH),
-        "lattice_r_ang": float(args.lattice_r),
         "vacuum_ang": float(args.vacuum),
-        "chain_length_ang": chain_length,
-        "vacancy_image_separation_ang": chain_length,
-        "wrap_bond_ang": float(wrap_bond_ang),
         "seed_displace_ang": float(args.seed_displace),
         "input_xyz": None if args.xyz is None else os.fspath(args.xyz),
         "input_geometry": input_description,
         "output_dir": os.fspath(output_dir),
         "vacancy_index_zero_based": int(vacancy_index),
         "movable_atoms_zero_based": [int(i) for i in movable],
-        "relax_radius_ang": fragment_relax_radius(fragment, args.lattice_r),
-        "relax_radius_policy": "fragment extent from N_Frag",
-        "relax_radius_request": "auto",
         "relax_on_active_energy": False,
-        "pinned_chain_end_atoms_zero_based": [],
         "defective_supercell_scf": False,
-        "full_chain_is_large_cell_scf": True,
-        "initial_uniform_geometry_primitive_kmesh": [chain_cells, 1, 1],
-        "periodic_scf": "pristine full-chain Gamma KRHF with the vacancy restored",
         "pristine_reference_policy": "exact",
         "fragment_policy": "nearest atoms at first accepted centre, fixed thereafter",
         "bath_rank_policy": "threshold at first accepted centre, fixed thereafter",
@@ -193,42 +330,10 @@ def run_one(
     input_xyz: Path | None = None,
 ) -> Path:
     case = CASES[case_name]
-    chain_cells = int(args.chain_cells)
-    if input_xyz is None:
-        labels, coords_bohr, vacancy_index = build_starting_geometry(
-            case_name, chain_cells, args.lattice_r
-        )
-        input_description = "generated LiH-1D + central %s vacancy" % case.vacancy
-    else:
-        labels, coords_bohr, vacancy_index = read_xyz(input_xyz)
-        input_description = os.fspath(input_xyz)
-
-    parent_species = ghost_species(labels[vacancy_index])
-    if parent_species.lower() != case.vacancy.lower():
-        raise ValueError(
-            "%s contains %s at the ghost site, expected %s"
-            % (input_description, parent_species, case.vacancy)
-        )
-    expected_natm = 2 * chain_cells
-    if len(labels) != expected_natm:
-        raise ValueError(
-            "%s has %d atoms; a %d-cell full LiH chain requires %d atoms"
-            % (input_description, len(labels), chain_cells, expected_natm)
-        )
-    if fragment > expected_natm:
-        raise ValueError(
-            "fragment size %d exceeds the %d-atom full chain"
-            % (fragment, expected_natm)
-        )
-    wrap_bond_ang = check_geometry_fits_lattice(
-        coords_bohr, chain_cells, args.lattice_r, input_description
-    )
-
-    coords_bohr = seed_displace_from_vacancy(
-        coords_bohr, vacancy_index, args.seed_displace
-    )
-    movable = movable_atoms(
-        labels, coords_bohr, vacancy_index, fragment, args.lattice_r
+    build_geometry = _hbn_geometry if case.host == HBN2D else _lih_geometry
+    (labels, coords_bohr, vacancy_index, movable, input_description,
+     lattice_bohr, geometry_fields) = build_geometry(
+        args, case_name, fragment, input_xyz
     )
     if not movable:
         raise ValueError("no real atoms selected for relaxation")
@@ -275,6 +380,9 @@ def run_one(
         cas_weight_gap_tol=float(getattr(args, "cas_weight_gap_tol", 1e-3)),
         cas_weight_floor=float(getattr(args, "cas_weight_floor", 0.1)),
         allow_degenerate_cas=bool(getattr(args, "allow_degenerate_cas", False)),
+        cas_selection=_cas_selection(args, case),
+        cas_energy_gap_tol=float(getattr(args, "cas_energy_gap_tol", 1e-4)),
+        wrap_about_vacancy=_wrap_about_vacancy(args, case),
     )
     driver_mol = build_driver_molecule(
         labels, coords_bohr, case, args.basis, args.memory_mb, args.verbose
@@ -298,7 +406,7 @@ def run_one(
         output_dir,
         run_configuration(
             args, case_name, fragment, labels, vacancy_index, movable,
-            output_dir, input_description, wrap_bond_ang,
+            output_dir, input_description, geometry_fields,
             1 if getattr(args, "energy_only", False) else
             point_count_per_gradient(movable, args.fd_axis_indices, args.fd_mode),
         ),
@@ -310,7 +418,7 @@ def run_one(
         settings,
         labels,
         vacancy_index,
-        full_chain_lattice(chain_cells, args.lattice_r, args.vacuum),
+        lattice_bohr,
         recorder=recorder,
     )
     # --energy-only: hand the scanner no movable atoms, so one call evaluates the

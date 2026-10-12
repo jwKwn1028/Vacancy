@@ -17,6 +17,15 @@ from hact_relax.cases import (
     VacancyCase,
     fragment_relax_radius,
 )
+from system.hbn import (
+    A_HBN,
+    HBN_CELLS,
+    VACUUM_HBN,
+    central_boron_index,
+    hbn_supercell,
+    hbn_supercell_lattice,
+)
+from system.shells import minimum_image_distances, nearest_atoms
 from system.vacancy import get_vacancy_xyz
 
 
@@ -90,6 +99,85 @@ def build_starting_geometry(
     return parse_xyz(
         generated_starting_xyz(case_name, ncells, r_ang),
         "generated %s" % case_name,
+    )
+
+
+def generated_hbn_xyz(
+    case_name: str,
+    ncells: int = HBN_CELLS,
+    a_ang: float = A_HBN,
+    vacuum_ang: float = VACUUM_HBN,
+) -> str:
+    case = CASES[case_name]
+    symbols, coords, _ = hbn_supercell(ncells, a_ang, vacuum_ang)
+    vacancy_index = central_boron_index(ncells)
+    if symbols[vacancy_index] != case.vacancy:
+        raise ValueError(
+            "hBN site %d is %s, not the %s vacancy of case %s"
+            % (vacancy_index, symbols[vacancy_index], case.vacancy, case_name)
+        )
+    rows = []
+    for index, (symbol, xyz) in enumerate(zip(symbols, coords)):
+        label = "GHOST-" + symbol if index == vacancy_index else symbol
+        rows.append("%-8s %18.10f %18.10f %18.10f" % (label, *xyz))
+    comment = (
+        "hBN-2D a=%.4f A, %dx%d supercell (%d atoms), vacuum %.1f A, one %s vacancy"
+        % (a_ang, ncells, ncells, len(symbols), vacuum_ang, case.vacancy)
+    )
+    return "%d\n%s\n%s\n" % (len(symbols), comment, "\n".join(rows))
+
+
+def build_hbn_starting_geometry(
+    case_name: str,
+    ncells: int = HBN_CELLS,
+    a_ang: float = A_HBN,
+    vacuum_ang: float = VACUUM_HBN,
+) -> tuple[list[str], np.ndarray, int]:
+    return parse_xyz(
+        generated_hbn_xyz(case_name, ncells, a_ang, vacuum_ang),
+        "generated %s" % case_name,
+    )
+
+
+def hbn_lattice(
+    ncells: int = HBN_CELLS, a_ang: float = A_HBN, vacuum_ang: float = VACUUM_HBN
+) -> np.ndarray:
+    """Supercell lattice vectors as rows, Bohr."""
+    return hbn_supercell_lattice(ncells, a_ang, vacuum_ang) / BOHR
+
+
+def check_geometry_fits_supercell(
+    coords_bohr: np.ndarray, lattice_bohr: np.ndarray, source: str
+) -> float:
+    """Shortest nearest-image distance between two atoms, Angstrom.
+
+    The 2D analogue of the chain's wrap-bond check: an atom moved onto another
+    one's periodic image shows up as a vanishing distance.
+    """
+    coords = np.asarray(coords_bohr, dtype=float)
+    shortest = min(
+        float(np.delete(minimum_image_distances(coords, lattice_bohr, i), i).min())
+        for i in range(len(coords))
+    ) * BOHR
+    if shortest < 0.5:
+        raise ValueError(
+            "%s has two atoms %.4f A apart under the nearest-image rule; the "
+            "geometry does not fit its supercell" % (source, shortest)
+        )
+    return shortest
+
+
+def fragment_movable_atoms(
+    labels: Sequence[str],
+    coords_bohr: np.ndarray,
+    lattice_bohr: np.ndarray,
+    vacancy_index: int,
+    n_frag: int,
+) -> list[int]:
+    """The real atoms of the fragment: its complete shells, minus the ghost."""
+    fragment = nearest_atoms(coords_bohr, lattice_bohr, vacancy_index, n_frag)
+    return sorted(
+        i for i in fragment if not labels[i].upper().startswith("GHOST")
     )
 
 
@@ -204,14 +292,13 @@ def build_driver_molecule(
     memory_mb: int,
     verbose: int,
 ):
+    species = {label for label in labels if not label.upper().startswith("GHOST")}
+    basis_by_label = {symbol: basis for symbol in sorted(species)}
+    basis_by_label["GHOST-" + case.vacancy] = gto.basis.load(basis, case.vacancy)
     return gto.M(
         atom=[[label, xyz] for label, xyz in zip(labels, coords_bohr)],
         unit="Bohr",
-        basis={
-            "Li": basis,
-            "H": basis,
-            "GHOST-" + case.vacancy: gto.basis.load(basis, case.vacancy),
-        },
+        basis=basis_by_label,
         charge=case.charge,
         spin=case.spin,
         verbose=verbose,

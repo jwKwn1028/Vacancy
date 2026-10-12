@@ -544,6 +544,82 @@ def select_vacancy_local_cas(
     return order, diagnostics
 
 
+def select_energy_frontier_cas(
+    occupations,
+    orbital_energy,
+    *,
+    ncas: int,
+    ncas_elec: int,
+    ncore: int,
+    gap_tol: float = 1e-4,
+    allow_degenerate: bool = False,
+) -> tuple[np.ndarray, dict]:
+    """Order H_act^V so the CAS is the frontier window in orbital energy.
+
+    The ``ncore`` lowest orbitals are the doubly occupied core and the next
+    ``ncas`` the CAS, which must then hold exactly ``ncas_elec`` electrons with
+    every orbital above it empty.  Returns the same ``core + cas + virtual``
+    permutation and diagnostics as ``select_vacancy_local_cas``.
+    """
+    occupations = np.asarray(occupations, dtype=float)
+    orbital_energy = np.asarray(orbital_energy, dtype=float)
+    nact = orbital_energy.size
+    if occupations.size != nact:
+        raise ValueError(
+            "occupations and orbital energies must both span the active space: "
+            "got %d and %d" % (occupations.size, nact)
+        )
+    if ncore < 0 or ncore + ncas > nact:
+        raise ValueError(
+            "CAS(%de,%do) with ncore=%d does not fit %d active orbitals"
+            % (ncas_elec, ncas, ncore, nact)
+        )
+    order = np.argsort(orbital_energy, kind="stable")
+    core, cas, virtual = order[:ncore], order[ncore:ncore + ncas], order[ncore + ncas:]
+    window_electrons = float(occupations[cas].sum())
+    if (np.any(occupations[core] < 1.5) or np.any(occupations[virtual] > 0.5)
+            or abs(window_electrons - ncas_elec) > 1e-8):
+        raise ValueError(
+            "the frontier window of CAS(%de,%do) is not aufbau-consistent: it "
+            "holds %g electrons, %d core orbitals below it are not doubly "
+            "occupied and %d orbitals above it are not empty.  The reference "
+            "determinant does not fill the active orbitals in energy order, so "
+            "an energy window cannot hold the CAS electrons"
+            % (ncas_elec, ncas, window_electrons,
+               int(np.sum(occupations[core] < 1.5)),
+               int(np.sum(occupations[virtual] > 0.5)))
+        )
+
+    gap_below = (float(orbital_energy[cas[0]] - orbital_energy[core[-1]])
+                 if core.size and cas.size else None)
+    gap_above = (float(orbital_energy[virtual[0]] - orbital_energy[cas[-1]])
+                 if virtual.size and cas.size else None)
+    diagnostics = {
+        "cas_selection": "energy",
+        "cas_indices": [int(i) for i in cas],
+        "cas_orbital_energies": [float(orbital_energy[i]) for i in cas],
+        "cas_energy_gap_below_hartree": gap_below,
+        "cas_energy_gap_above_hartree": gap_above,
+        "cas_energy_gap_tol_hartree": float(gap_tol),
+        "cas_degenerate_cut": False,
+    }
+    for name, gap in (("lower", gap_below), ("upper", gap_above)):
+        if gap is None or gap >= gap_tol:
+            continue
+        diagnostics["cas_degenerate_cut"] = True
+        message = (
+            "the %s edge of the CAS(%de,%do) energy window cuts through a "
+            "near-degenerate pair: the orbitals on either side differ by "
+            "%.3e Ha, below the %.3e Ha tolerance.  Change --ncas/--ncas-elec so "
+            "the window takes or leaves the whole set, or pass "
+            "--allow-degenerate-cas" % (name, ncas_elec, ncas, gap, gap_tol)
+        )
+        if not allow_degenerate:
+            raise ValueError(message)
+        print("# warning: %s" % message, flush=True)
+    return np.concatenate([core, cas, virtual]).astype(int), diagnostics
+
+
 def casci_energy(
     solver,
     result,
@@ -557,6 +633,8 @@ def casci_energy(
     cas_weight_gap_tol: float = 1e-3,
     cas_weight_floor: float = 0.1,
     allow_degenerate_cas: bool = False,
+    cas_selection: str = "vacancy-local",
+    cas_energy_gap_tol: float = 1e-4,
 ) -> CASCIResult:
     """CASCI on ``H_act^V`` with a vacancy-local CAS and root tracking."""
     h1e = np.asarray(result[5]).real
@@ -585,9 +663,20 @@ def casci_energy(
     cas_window_min_overlap = None
     orbital_subspace_singular_values = None
     selection = None
-    if reference is None:
-        # First accepted centre: cut the window by locality on the vacancy.
-        # Later geometries inherit this ordering through the Hungarian match.
+    if reference is None and cas_selection == "energy":
+        order, selection = select_energy_frontier_cas(
+            active_occ,
+            orbital_energy,
+            ncas=ncas,
+            ncas_elec=ncas_elec,
+            ncore=ncore,
+            gap_tol=cas_energy_gap_tol,
+            allow_degenerate=allow_degenerate_cas,
+        )
+        signs = np.ones(order.size)
+    elif reference is None:
+        if cas_selection != "vacancy-local":
+            raise ValueError("unknown CAS selection %r" % cas_selection)
         if active_coeff is None:
             raise RuntimeError(
                 "the vacancy-local CAS needs the active orbitals, but this "

@@ -11,6 +11,16 @@ CHAIN_CELLS = 21
 R_ANG = 1.7
 FRAGMENTS = (1, 3, 5, 7, 9)
 
+LIH1D = "lih1d"
+HBN2D = "hbn2d"
+HOST_FRAGMENTS = {
+    LIH1D: FRAGMENTS,
+    HBN2D: (1, 4, 10, 13, 19),
+}
+HOST_DEFAULT_BASIS = {LIH1D: "pob-tzvp", HBN2D: "cc-pvdz"}
+HOST_DEFAULT_FD_AXES = {LIH1D: "x", HBN2D: "xy"}
+HOST_DEFAULT_WRAP = {LIH1D: False, HBN2D: True}
+
 
 @dataclass(frozen=True)
 class VacancyCase:
@@ -18,13 +28,11 @@ class VacancyCase:
     charge: int
     spin: int
     seed_vacancy: bool
-    # CAS window for --state excited, cut inside the (much larger) embedding
-    # active space and built from the orbitals most localized on the vacancy.
-    # ncas_elec fixes how many of them are occupied.  The window SIZE is a
-    # property of the defect, not of the embedding, so it lives here.
     ncas: int
     ncas_elec: int
     level_shift: float
+    host: str = LIH1D
+    cas_selection: str = "vacancy-local"
 
 
 CASES = {
@@ -32,11 +40,15 @@ CASES = {
     "vhc": VacancyCase("H", -1, 2, True, 10, 8, 0.4),
     "vln": VacancyCase("Li", 0, 1, False, 8, 7, 0.2),
     "vlc": VacancyCase("Li", -1, 0, True, 8, 6, 0.4),
+    "vbc": VacancyCase("B", -1, 2, False, 6, 10, 0.4, host=HBN2D,
+                       cas_selection="energy"),
 }
 
 
 def parse_cases(value: str) -> list[str]:
-    values = list(CASES) if value == "all" else value.split(",")
+    # "all" keeps its original meaning: the four LiH-1D vacancies.
+    values = ([name for name, case in CASES.items() if case.host == LIH1D]
+              if value == "all" else value.split(","))
     values = list(dict.fromkeys(v.strip() for v in values if v.strip()))
     unknown = sorted(set(values) - set(CASES))
     if unknown:
@@ -44,14 +56,29 @@ def parse_cases(value: str) -> list[str]:
     return values
 
 
-def parse_fragments(value: str) -> list[int]:
-    values = list(FRAGMENTS) if value == "all" else [
+def case_host(case_names) -> str:
+    """The one host the requested cases share."""
+    hosts = sorted({CASES[name].host for name in case_names})
+    if len(hosts) != 1:
+        raise ValueError(
+            "cases %s mix the hosts %s; run each host separately"
+            % (", ".join(case_names), ", ".join(hosts))
+        )
+    return hosts[0]
+
+
+def parse_fragments(value: str, allowed=FRAGMENTS) -> list[int]:
+    allowed = tuple(int(v) for v in allowed)
+    values = list(allowed) if value == "all" else [
         int(v) for v in value.split(",")
     ]
     values = list(dict.fromkeys(values))
-    unknown = sorted(set(values) - set(FRAGMENTS))
+    unknown = sorted(set(values) - set(allowed))
     if unknown:
-        raise ValueError("fragment size(s) must be 1,3,5,7,9; got %s" % unknown)
+        raise ValueError(
+            "fragment size(s) must be %s; got %s"
+            % (",".join(str(v) for v in allowed), unknown)
+        )
     return values
 
 

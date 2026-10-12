@@ -9,6 +9,7 @@ from pyscf.pbc.tools import k2gamma
 from pyscf.scf import rohf
 
 from system.iao_pao import iao_pao_supercell
+from system.shells import minimum_image_offsets, nearest_atoms
 
 from .frozen_rhf import Frozen_RHF
 from .frozen_rohf import Frozen_ROHF
@@ -30,7 +31,8 @@ class _SchmidtEmbedding:
                    verbose=0, defect=True, eri_mode="cluster",
                    seed_vacancy=False, vacancy_index=None,
                    fixed_n_bath=None, fixed_fragment_atoms=None,
-                   compute_core_energy=True, auxbasis=None):
+                   compute_core_energy=True, auxbasis=None,
+                   wrap_about_vacancy=False):
         self.kmf = kmf
         self.kmesh = list(kmesh)
         self.vac_species = vac_species
@@ -49,6 +51,7 @@ class _SchmidtEmbedding:
         self.fixed_fragment_atoms = fixed_fragment_atoms
         self.compute_core_energy = bool(compute_core_energy)
         self.auxbasis = auxbasis
+        self.wrap_about_vacancy = bool(wrap_about_vacancy)
 
         self.mo_coeff = self.mo_occ = self.active_orb = None
         self.mo_occ_D = None
@@ -393,8 +396,9 @@ class _SchmidtEmbedding:
         self.vac_idx_sc = vac_idx if self.defect else []
 
         if self.fixed_fragment_atoms is None:
-            order = np.argsort(np.abs(x - x[vac_idx[0]]))
-            frag_atoms = set(int(a) for a in order[: self.n_frag])
+            frag_atoms = set(nearest_atoms(
+                coords, scell.lattice_vectors(), vac_idx[0], self.n_frag
+            ))
         else:
             frag_atoms = set(int(a) for a in self.fixed_fragment_atoms)
             invalid = sorted(a for a in frag_atoms if not 0 <= a < scell.natm)
@@ -448,10 +452,33 @@ class _SchmidtEmbedding:
         Lij = np.concatenate(Lij_chunks, axis=0)
         self.eri_active = lib.einsum("Lij,Lkl->ijkl", Lij, Lij).real
 
+    def _defect_frame_coords(self):
+        coords = self.scell.atom_coords()
+        if not self.wrap_about_vacancy:
+            return coords
+        center = self.fragment_center_idx[0]
+        return coords[center] + minimum_image_offsets(
+            coords, self.scell.lattice_vectors(), center
+        )
+
+    def _defect_frame_mol(self):
+        scell = self.scell
+        coords = self._defect_frame_coords()
+        return mol_gto.M(
+            atom=[[scell.atom_symbol(i), coords[i]] for i in range(scell.natm)],
+            unit="Bohr",
+            basis=scell.basis,
+            charge=0,
+            spin=int(round(sum(scell.atom_charges()))) % 2,
+            verbose=0,
+            max_memory=scell.max_memory,
+        )
+
     def _eri_act_cluster(self, Cact):
         scell = self.scell
+        coords = self._defect_frame_coords()
         mol = mol_gto.M(
-            atom=[[scell.atom_symbol(i), scell.atom_coord(i)]
+            atom=[[scell.atom_symbol(i), coords[i]]
                   for i in range(scell.natm)],
             unit="Bohr",
             basis=scell.basis,
@@ -481,16 +508,18 @@ class _SchmidtEmbedding:
     def _nuc_ao_integral_for_atom(self, symmetric=True):
         nao = self.scell.nao_nr()
         h1e_nuc = np.zeros((nao, nao))
+        # Cell.intor is the molecular integral over the in-cell positions.
+        mol = self._defect_frame_mol() if self.wrap_about_vacancy else self.scell
         for idx in self.vac_idx_sc:
             Z = element_charge(self.scell.atom_symbol(idx))
-            with self.scell.with_rinv_at_nucleus(idx):
-                V = (self.scell.intor_symmetric("int1e_rinv") if symmetric
-                     else self.scell.intor("int1e_rinv"))
+            with mol.with_rinv_at_nucleus(idx):
+                V = (mol.intor_symmetric("int1e_rinv") if symmetric
+                     else mol.intor("int1e_rinv"))
             h1e_nuc += -Z * V
         return h1e_nuc
 
     def _nuclear_repulsion_with_atom(self):
-        coords = self.scell.atom_coords()
+        coords = self._defect_frame_coords()
         Z = [element_charge(self.scell.atom_symbol(i)) for i in range(self.scell.natm)]
         vac = set(self.vac_idx_sc)
         Enuc_at = 0.0

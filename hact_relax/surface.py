@@ -74,6 +74,9 @@ class SurfaceSettings:
     cas_weight_gap_tol: float = 1e-3
     cas_weight_floor: float = 0.1
     allow_degenerate_cas: bool = False
+    cas_selection: str = "vacancy-local"
+    cas_energy_gap_tol: float = 1e-4
+    wrap_about_vacancy: bool = False
 
 
 class ActiveHamiltonianSurface:
@@ -453,6 +456,7 @@ class ActiveHamiltonianSurface:
             fixed_n_bath=self.fixed_n_bath,
             fixed_fragment_atoms=self.fixed_fragment_atoms,
             auxbasis=settings.auxbasis,
+            wrap_about_vacancy=settings.wrap_about_vacancy,
         )
         with self.recorder.stage(
             "embedding_build", evaluation=evaluation, reason=reason
@@ -478,7 +482,7 @@ class ActiveHamiltonianSurface:
             solver.scell.atom_coords(), coords_bohr, atol=1e-9, rtol=0.0
         ):
             raise RuntimeError(
-                "full-chain KRHF/embedding coordinates do not match the "
+                "supercell KRHF/embedding coordinates do not match the "
                 "requested relaxation geometry"
             )
 
@@ -666,6 +670,8 @@ class ActiveHamiltonianSurface:
                     cas_weight_gap_tol=settings.cas_weight_gap_tol,
                     cas_weight_floor=settings.cas_weight_floor,
                     allow_degenerate_cas=settings.allow_degenerate_cas,
+                    cas_selection=settings.cas_selection,
+                    cas_energy_gap_tol=settings.cas_energy_gap_tol,
                 )
             selected_overlap = (
                 None if self.casci_reference is None

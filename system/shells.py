@@ -4,6 +4,7 @@ import numpy as np
 
 
 SHELL_TOL_BOHR = 1e-4
+IMAGE_TIE_TOL = 1e-6
 
 _NEIGHBOUR_SHIFTS = np.array(list(itertools.product((-1, 0, 1), repeat=3)))
 
@@ -21,8 +22,20 @@ def minimum_image_offsets(coords, lattice, center):
     lattice = np.asarray(lattice, dtype=float)
     frac = np.linalg.solve(lattice.T, (coords - coords[int(center)]).T).T
     frac -= np.round(frac)
-    candidates = (frac[:, None, :] + _NEIGHBOUR_SHIFTS[None]) @ lattice
-    nearest = np.argmin(np.linalg.norm(candidates, axis=2), axis=1)
+    candidate_frac = frac[:, None, :] + _NEIGHBOUR_SHIFTS[None]
+    candidates = candidate_frac @ lattice
+    norms = np.linalg.norm(candidates, axis=2)
+    # An atom on the edge of the nearest-image region has two or three images at
+    # the same distance.  Pick among them by their rounded fractional
+    # coordinates, so that rounding noise in the input (an xyz file) cannot
+    # change which image a term sees.
+    tied = norms <= norms.min(axis=1, keepdims=True) + IMAGE_TIE_TOL
+    nearest = np.empty(len(coords), dtype=int)
+    for i in range(len(coords)):
+        options = np.flatnonzero(tied[i])
+        nearest[i] = max(
+            options, key=lambda j: tuple(np.round(candidate_frac[i, j], 6))
+        )
     return candidates[np.arange(len(coords)), nearest]
 
 

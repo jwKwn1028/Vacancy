@@ -26,7 +26,7 @@ from hact_relax.errors import (
     SCFNotConverged,
     SubspaceContinuityError,
 )
-from hact_relax.geometry import restored_pristine_atoms
+from hact_relax.geometry import ideal_supercell, restored_pristine_atoms
 from hact_relax.recording import NullRecorder
 from hact_relax.tracking import (
     ActiveSolutionReference,
@@ -77,6 +77,8 @@ class SurfaceSettings:
     cas_selection: str = "vacancy-local"
     cas_energy_gap_tol: float = 1e-4
     wrap_about_vacancy: bool = False
+    primitive_atoms: list | None = None
+    primitive_lattice_bohr: np.ndarray | None = None
 
 
 class ActiveHamiltonianSurface:
@@ -107,6 +109,12 @@ class ActiveHamiltonianSurface:
         self.last_center_followed = False
         self.last_energy_terms: dict[str, float] | None = None
         self.measured_noise_floor: float | None = None
+        self.ideal_coords_bohr: np.ndarray | None = None
+        if settings.primitive_atoms is not None:
+            _, self.ideal_coords_bohr = ideal_supercell(
+                settings.primitive_atoms, settings.primitive_lattice_bohr,
+                settings.reference_kmesh,
+            )
 
     @staticmethod
     def _key(coords_bohr: np.ndarray) -> str:
@@ -331,6 +339,15 @@ class ActiveHamiltonianSurface:
             )
         settings = self.settings
         coords_bohr = np.asarray(coords_bohr, dtype=float).reshape(-1, 3)
+        if self.ideal_coords_bohr is not None and not np.allclose(
+            coords_bohr, self.ideal_coords_bohr, atol=1e-9, rtol=0.0
+        ):
+            raise ValueError(
+                "%s: the k-point reference describes only the ideal lattice, "
+                "and this geometry is displaced from it by up to %.3e Bohr; "
+                "use the Gamma reference for displaced geometries"
+                % (reason, float(np.abs(coords_bohr - self.ideal_coords_bohr).max()))
+            )
         strict_continuation = displaced_atom is not None
         started = time.time()
         evaluation = self.recorder.next_evaluation()
@@ -366,6 +383,9 @@ class ActiveHamiltonianSurface:
             "displaced_atom": (None if displaced_atom is None
                                else int(displaced_atom)),
             "pristine_kmesh": list(settings.reference_kmesh),
+            "pristine_reference": (
+                "gamma" if self.ideal_coords_bohr is None else "kmesh"
+            ),
             "pristine_reference_policy": "exact",
             "checkpoint_saved": False,
         }
@@ -390,12 +410,20 @@ class ActiveHamiltonianSurface:
                 "density_change_norm": float(envs["norm_ddm"]),
             })
 
+        if self.ideal_coords_bohr is None:
+            pristine_atoms = restored_pristine_atoms(self.labels, coords_bohr)
+            pristine_lattice = self.lattice_bohr
+        else:
+            pristine_atoms = settings.primitive_atoms
+            pristine_lattice = settings.primitive_lattice_bohr
+        # On a k-mesh the KRHF energy is per primitive cell.
+        ncells = int(np.prod(settings.reference_kmesh))
         with self.recorder.stage(
             "pristine_scf", evaluation=evaluation, reason=reason
         ):
             _, pristine_kmf = build_pristine_mean_field(
-                restored_pristine_atoms(self.labels, coords_bohr),
-                self.lattice_bohr,
+                pristine_atoms,
+                pristine_lattice,
                 settings.basis,
                 kmesh=settings.reference_kmesh,
                 pseudo=None,
@@ -414,7 +442,8 @@ class ActiveHamiltonianSurface:
                          if accept_center else None),
             )
         record.update({
-            "pristine_energy_hartree": float(pristine_kmf.e_tot),
+            "pristine_energy_hartree": float(pristine_kmf.e_tot) * ncells,
+            "pristine_energy_per_cell_hartree": float(pristine_kmf.e_tot),
             "pristine_scf_converged": bool(pristine_kmf.converged),
             "pristine_scf_cycles": pristine_scf["cycles"],
             "pristine_scf_final_delta_energy_hartree": pristine_scf["delta"],
@@ -422,7 +451,7 @@ class ActiveHamiltonianSurface:
             "pristine_guess_from_previous_center": prior_pristine is not None,
         })
         if pristine_scf["delta"] is not None:
-            noise = abs(float(pristine_scf["delta"]))
+            noise = abs(float(pristine_scf["delta"])) * ncells
             self.measured_noise_floor = max(
                 noise, self.measured_noise_floor or 0.0
             )

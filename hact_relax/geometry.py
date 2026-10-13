@@ -22,6 +22,8 @@ from system.hbn import (
     HBN_CELLS,
     VACUUM_HBN,
     central_boron_index,
+    hbn_primitive_atoms,
+    hbn_primitive_lattice,
     hbn_supercell,
     hbn_supercell_lattice,
 )
@@ -179,6 +181,84 @@ def fragment_movable_atoms(
     return sorted(
         i for i in fragment if not labels[i].upper().startswith("GHOST")
     )
+
+
+def ideal_supercell(primitive_atoms, primitive_lattice, kmesh):
+    """(symbols, coords) of the primitive cell repeated over ``kmesh``.
+
+    Image by image, the order pyscf.pbc.tools.super_cell and k2gamma use, so it
+    is the supercell the k-point embedding unfolds to.  Units are those of the
+    inputs.
+    """
+    lattice = np.asarray(primitive_lattice, dtype=float)
+    images = np.array([
+        [i, j, k]
+        for i in range(int(kmesh[0]))
+        for j in range(int(kmesh[1]))
+        for k in range(int(kmesh[2]))
+    ])
+    shifts = images @ lattice
+    symbols = [str(symbol) for _ in shifts for symbol, _ in primitive_atoms]
+    coords = np.array([
+        np.asarray(xyz, dtype=float) + shift
+        for shift in shifts for _, xyz in primitive_atoms
+    ])
+    return symbols, coords
+
+
+def lih_primitive_cell(
+    r_ang: float = R_ANG, vacuum_ang: float = 30.0
+) -> tuple[list, np.ndarray]:
+    """The 2-atom LiH-1D cell as ([symbol, xyz], lattice), Bohr."""
+    atoms = [["Li", np.zeros(3)], ["H", np.array([float(r_ang) / BOHR, 0.0, 0.0])]]
+    return atoms, full_chain_lattice(1, r_ang, vacuum_ang)
+
+
+def hbn_primitive_cell(
+    a_ang: float = A_HBN, vacuum_ang: float = VACUUM_HBN
+) -> tuple[list, np.ndarray]:
+    """The 2-atom hBN-2D cell as ([symbol, xyz], lattice), Bohr."""
+    atoms = [[symbol, np.asarray(xyz) / BOHR]
+             for symbol, xyz in hbn_primitive_atoms(a_ang, vacuum_ang)]
+    return atoms, hbn_primitive_lattice(a_ang, vacuum_ang) / BOHR
+
+
+def snap_to_ideal_lattice(
+    labels: Sequence[str],
+    coords_bohr: np.ndarray,
+    ideal_symbols: Sequence[str],
+    ideal_coords_bohr: np.ndarray,
+    source: str,
+    tol_bohr: float = 1e-6,
+) -> np.ndarray:
+    """The ideal coordinates, after checking the geometry is that lattice.
+
+    A k-point reference is the perfect crystal, so it can only stand for a
+    geometry that is the ideal lattice up to the rounding of an xyz file.
+    """
+    coords = np.asarray(coords_bohr, dtype=float)
+    ideal = np.asarray(ideal_coords_bohr, dtype=float)
+    if len(labels) != len(ideal_symbols) or coords.shape != ideal.shape:
+        raise ValueError(
+            "%s has %d atoms; the k-point supercell has %d"
+            % (source, len(labels), len(ideal_symbols))
+        )
+    wrong = [i for i, (label, symbol) in enumerate(zip(labels, ideal_symbols))
+             if ghost_species(label).lower() != symbol.lower()]
+    if wrong:
+        raise ValueError(
+            "%s does not list its atoms in the k-point supercell order: atom %d "
+            "is %s, expected %s"
+            % (source, wrong[0], labels[wrong[0]], ideal_symbols[wrong[0]])
+        )
+    deviation = float(np.abs(coords - ideal).max()) if coords.size else 0.0
+    if deviation > tol_bohr:
+        raise ValueError(
+            "%s is displaced from the ideal lattice by up to %.3e Bohr; the "
+            "k-point reference describes only the perfect crystal, so use the "
+            "Gamma reference for this geometry" % (source, deviation)
+        )
+    return ideal.copy()
 
 
 def write_xyz(

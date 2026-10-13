@@ -65,6 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "rhombus rather than the hexagon of nearest images, "
                              "and off for LiH-1D, whose vacancy is mid-chain")
     parser.add_argument("--vacuum", type=float, default=30.0)
+    parser.add_argument("--reference", choices=("gamma", "kmesh"),
+                        default="gamma",
+                        help="pristine mean field: gamma (default) is the KRHF "
+                             "of the whole supercell at the requested geometry; "
+                             "kmesh is the 2-atom primitive cell on the k-mesh "
+                             "that unfolds to the same supercell, which skips "
+                             "the supercell density fitting.  The "
+                             "k-mesh is the perfect crystal, so it needs the "
+                             "ideal lattice and --single-point --energy-only")
     parser.add_argument("--seed-displace", type=float, default=0.0)
     parser.add_argument("--coordsys", default="cart",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
@@ -180,6 +189,14 @@ def validate_args(parser: argparse.ArgumentParser, args):
         parser.error("--threads must be parsed before NumPy; pass it once")
     if args.energy_only and not args.single_point:
         parser.error("--energy-only only makes sense with --single-point")
+    if args.reference == "kmesh" and not (args.single_point and args.energy_only):
+        parser.error(
+            "--reference kmesh describes only the ideal lattice: finite-difference "
+            "displacements and relaxation steps break its periodicity, so it needs "
+            "--single-point --energy-only"
+        )
+    if args.reference == "kmesh" and args.seed_displace != 0.0:
+        parser.error("--reference kmesh needs the ideal lattice; drop --seed-displace")
     if args.memory_mb < 1 or args.fd_step <= 0 or args.maxsteps < 1:
         parser.error("--memory-mb, --fd-step and --maxsteps must be positive")
     if args.max_gradient <= 0.0 or args.bath_tol <= 0.0:

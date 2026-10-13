@@ -29,6 +29,10 @@ from hact_relax.geometry import (
     full_chain_lattice,
     ghost_species,
     hbn_lattice,
+    hbn_primitive_cell,
+    ideal_supercell,
+    lih_primitive_cell,
+    snap_to_ideal_lattice,
     movable_atoms,
     patch_geometric_for_ghost_atoms,
     read_xyz,
@@ -201,6 +205,30 @@ def _hbn_geometry(args, case_name, fragment, input_xyz):
             lattice_bohr, fields)
 
 
+def _pristine_reference(args, case, labels, coords_bohr, input_description):
+    """(coords, kmesh, primitive atoms, primitive lattice) of the pristine reference.
+
+    "gamma" (the default) builds the mean field of the supercell itself, at
+    whatever geometry is asked.  "kmesh" builds the 2-atom primitive cell on the
+    k-mesh that unfolds to the same supercell, which skips the supercell's
+    density fitting.  The k-mesh describes the perfect crystal, so it needs the
+    ideal lattice, and the coordinates are snapped onto it.
+    """
+    if getattr(args, "reference", "gamma") != "kmesh":
+        return coords_bohr, FULL_CHAIN_KMESH, None, None
+    if case.host == HBN2D:
+        atoms, lattice = hbn_primitive_cell(args.hbn_a, args.vacuum)
+        kmesh = (int(args.hbn_cells), int(args.hbn_cells), 1)
+    else:
+        atoms, lattice = lih_primitive_cell(args.lattice_r, args.vacuum)
+        kmesh = (int(args.chain_cells), 1, 1)
+    symbols, ideal = ideal_supercell(atoms, lattice, kmesh)
+    coords_bohr = snap_to_ideal_lattice(
+        labels, coords_bohr, symbols, ideal, input_description
+    )
+    return coords_bohr, kmesh, atoms, lattice
+
+
 def run_configuration(
     args,
     case_name: str,
@@ -267,7 +295,6 @@ def run_configuration(
         "basis": args.basis,
         "auxbasis": None,
         **geometry_fields,
-        "reference_kmesh": list(FULL_CHAIN_KMESH),
         "vacuum_ang": float(args.vacuum),
         "seed_displace_ang": float(args.seed_displace),
         "input_xyz": None if args.xyz is None else os.fspath(args.xyz),
@@ -335,6 +362,17 @@ def run_one(
      lattice_bohr, geometry_fields) = build_geometry(
         args, case_name, fragment, input_xyz
     )
+    (coords_bohr, reference_kmesh, primitive_atoms,
+     primitive_lattice) = _pristine_reference(
+        args, case, labels, coords_bohr, input_description
+    )
+    geometry_fields["reference"] = str(getattr(args, "reference", "gamma"))
+    geometry_fields["reference_kmesh"] = list(reference_kmesh)
+    if primitive_atoms is not None:
+        geometry_fields["periodic_scf"] = (
+            "pristine primitive-cell KRHF on the reference k-mesh, unfolded to "
+            "the supercell by the embedding (ideal lattice only)"
+        )
     if not movable:
         raise ValueError("no real atoms selected for relaxation")
 
@@ -349,7 +387,7 @@ def run_one(
     settings = SurfaceSettings(
         case_name=case_name,
         fragment=fragment,
-        reference_kmesh=FULL_CHAIN_KMESH,
+        reference_kmesh=reference_kmesh,
         basis=args.basis,
         memory_mb=args.memory_mb,
         bath_tol=args.bath_tol,
@@ -383,6 +421,8 @@ def run_one(
         cas_selection=_cas_selection(args, case),
         cas_energy_gap_tol=float(getattr(args, "cas_energy_gap_tol", 1e-4)),
         wrap_about_vacancy=_wrap_about_vacancy(args, case),
+        primitive_atoms=primitive_atoms,
+        primitive_lattice_bohr=primitive_lattice,
     )
     driver_mol = build_driver_molecule(
         labels, coords_bohr, case, args.basis, args.memory_mb, args.verbose

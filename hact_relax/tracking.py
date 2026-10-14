@@ -185,12 +185,18 @@ def transport_active_solution(
     )
 
 
-def defect_orbital_index(solver, active_coeff):
+def defect_orbital_index(solver, active_coeff, occupations=None):
+    """The active orbital the tracked defect orbital is now, by overlap.
+    """
     c_def = getattr(solver, "_c_def", None)
     if c_def is None:
         return None
     active = np.asarray(active_coeff).real
     overlap = np.abs(np.asarray(c_def).real @ (solver.S @ active))
+    if occupations is not None:
+        occupied = np.asarray(occupations) > 0
+        if occupied.any():
+            overlap = np.where(occupied, overlap, -1.0)
     return int(np.argmax(overlap))
 
 

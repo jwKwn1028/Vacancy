@@ -592,6 +592,8 @@ def run_one(
                                  if recorder.pristine_chkfile.exists() else None),
             "hact_chkfile": (os.fspath(recorder.hact_chkfile)
                              if recorder.hact_chkfile.exists() else None),
+            "hact_input_chkfile": (os.fspath(recorder.hact_input_chkfile)
+                                   if recorder.hact_input_chkfile.exists() else None),
         })
         recorder.summary(outcome)
         recorder.close()

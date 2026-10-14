@@ -162,7 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "reported gradient is then zero, not converged")
 
     parser.add_argument("--resource-interval", type=float, default=30.0)
-    parser.add_argument("--no-eri-checkpoint", action="store_true")
+    parser.add_argument("--no-eri-checkpoint", action="store_true",
+                        help="leave the active ERIs out of hact.chk and "
+                             "hact_input.chk; smaller files, but the CASCI and "
+                             "the offline re-solve (hact_relax/resolve_hact.py) "
+                             "then cannot run from them")
 
     parser.add_argument("--threads", type=int, default=THREADS)
     parser.add_argument("--memory-mb", type=int,

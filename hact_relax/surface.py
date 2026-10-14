@@ -10,6 +10,7 @@ import numpy as np
 
 from frozen_bath_scf import second_order as so
 from frozen_bath_scf.orbital_optimizer import (
+    canonical_block_rotation,
     energy_at,
     minimize_orbitals,
     rotate_hamiltonian,
@@ -21,6 +22,7 @@ from frozen_bath_scf.schmidt_embedding import (
 from system.pristine import build_pristine_mean_field
 
 from hact_relax.cases import CASES
+from hact_relax.checkpoint import write_hact_checkpoint, write_hact_input_checkpoint
 from hact_relax.errors import (
     RootContinuityError,
     SCFNotConverged,
@@ -39,6 +41,89 @@ from hact_relax.tracking import (
     transport_active_solution,
     transport_defect_orbital,
 )
+
+
+def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=None):
+    """``result`` with its active orbitals rotated by exp(kappa).
+    """
+    h1e = np.asarray(result[5]).real
+    eri = np.asarray(result[6]).real
+    occ = np.asarray(result[4]).real
+    u = so._expm_antisym(kappa)
+    dm_a, dm_b = so.densities(occ)
+    v_a, v_b = so.general_veff(eri, u @ dm_a @ u.T, u @ dm_b @ u.T)
+    fock = so._rotate(h1e + 0.5 * (v_a + v_b), u)
+    if canonicalize:
+        block, mo_energy, off_diagonal = canonical_block_rotation(fock, occ)
+        u = u @ block
+    else:
+        mo_energy, off_diagonal = np.diag(fock).copy(), None
+    if info is not None:
+        info["orbitals_canonicalized"] = bool(canonicalize)
+        info["canonical_offdiagonal_fock_hartree"] = off_diagonal
+    h1e_new, eri_new = rotate_hamiltonian(h1e, eri, u)
+    updated = list(result)
+    updated[1] = float(energy)
+    updated[2] = mo_energy
+    updated[3] = np.asarray(result[3]).real @ u
+    updated[5] = h1e_new
+    updated[6] = eri_new
+    return updated
+
+
+def rescue_unconverged(result, gradient_limit):
+    """Finish an unconverged frozen-bath SCF by L-BFGS at fixed occupations.
+
+    Accepted when the final orbital gradient is at most ``gradient_limit``; the
+    accepted solution is canonical (``apply_orbital_rotation``).
+    """
+    if result[5] is None or result[6] is None:
+        return result, {"scf_rescued": False}
+    h1e = np.asarray(result[5]).real
+    eri = np.asarray(result[6]).real
+    occ = np.asarray(result[4]).real
+    _, kappa = minimize_orbitals(
+        h1e, eri, occ, np.zeros(int(so.rotation_mask(occ).sum()))
+    )
+    gradient = float(np.linalg.norm(so.orbital_gradient(h1e, eri, occ, kappa)))
+    if gradient > gradient_limit:
+        return result, {"scf_rescued": False, "scf_rescue_gradient_norm": gradient}
+    info = {"scf_rescued": True, "scf_rescue_gradient_norm": gradient}
+    updated = apply_orbital_rotation(
+        result, kappa, float(energy_at(h1e, eri, occ, kappa)), info=info
+    )
+    updated[0] = True
+    return updated, info
+
+
+def follow_negative_mode(result, tol):
+    """Follow the lowest orbital-Hessian mode if it is below -``tol``.
+
+    Returns the result, whether a mode was followed, and the record fields.  A
+    followed solution is canonical (``apply_orbital_rotation``).
+    """
+    h1e = np.asarray(result[5]).real
+    eri = np.asarray(result[6]).real
+    occ = np.asarray(result[4]).real
+    report = so.stability_analysis(h1e, eri, occ)
+    info = {
+        "negative_mode_eigenvalue": float(report["lowest"]),
+        "negative_mode_followed": False,
+        "negative_mode_energy_drop_hartree": None,
+    }
+    if report["lowest"] > -abs(tol):
+        return result, False, info
+
+    before = energy_at(h1e, eri, occ)
+    _, kappa = minimize_orbitals(
+        h1e, eri, occ, 0.2 * np.asarray(report["lowest_mode"], dtype=float)
+    )
+    after = energy_at(h1e, eri, occ, kappa)
+    info["negative_mode_energy_drop_hartree"] = float(after - before)
+    if not (after < before - abs(tol)):
+        return result, False, info
+    info["negative_mode_followed"] = True
+    return apply_orbital_rotation(result, kappa, after, info=info), True, info
 
 
 @dataclass
@@ -140,51 +225,13 @@ class ActiveHamiltonianSurface:
                 % (overlap, self.settings.min_center_subspace_overlap)
             )
 
-    @staticmethod
-    def _apply_orbital_rotation(result, kappa, energy):
-        h1e = np.asarray(result[5]).real
-        eri = np.asarray(result[6]).real
-        occ = np.asarray(result[4]).real
-        u = so._expm_antisym(kappa)
-        h1e_new, eri_new = rotate_hamiltonian(h1e, eri, u)
-        updated = list(result)
-        updated[1] = float(energy)
-        updated[3] = np.asarray(result[3]).real @ u
-        updated[5] = h1e_new
-        updated[6] = eri_new
-        dm_a, dm_b = so.densities(occ)
-        v_a, v_b = so.general_veff(eri, u @ dm_a @ u.T, u @ dm_b @ u.T)
-        updated[2] = np.diag(so._rotate(h1e + 0.5 * (v_a + v_b), u)).copy()
-        return updated
+    _apply_orbital_rotation = staticmethod(apply_orbital_rotation)
 
     def _rescue_limit(self) -> float:
         return self.settings.scf_conv_tol_grad * self.settings.rescue_tol_factor
 
     def _rescue_unconverged_scf(self, result):
-        if result[5] is None or result[6] is None:
-            return result, {"scf_rescued": False}
-        h1e = np.asarray(result[5]).real
-        eri = np.asarray(result[6]).real
-        occ = np.asarray(result[4]).real
-        _, kappa = minimize_orbitals(
-            h1e, eri, occ, np.zeros(int(so.rotation_mask(occ).sum()))
-        )
-        gradient = float(np.linalg.norm(
-            so.orbital_gradient(h1e, eri, occ, kappa)
-        ))
-        if gradient > self._rescue_limit():
-            return result, {
-                "scf_rescued": False,
-                "scf_rescue_gradient_norm": gradient,
-            }
-        updated = self._apply_orbital_rotation(
-            result, kappa, float(energy_at(h1e, eri, occ, kappa))
-        )
-        updated[0] = True
-        return updated, {
-            "scf_rescued": True,
-            "scf_rescue_gradient_norm": gradient,
-        }
+        return rescue_unconverged(result, self._rescue_limit())
 
     def _converge_on_center_branch(self, solver, result, start_rotation, start_occ):
         if start_rotation is None or start_occ is None:
@@ -214,38 +261,18 @@ class ActiveHamiltonianSurface:
             h1e,
             eri,
         ]
-        updated = self._apply_orbital_rotation(
-            seed, kappa, float(energy_at(h1e, eri, occ, kappa))
-        )
-        updated[0] = True
-        return updated, {
+        info = {
             "scf_rescued_on_center_branch": True,
             "scf_rescue_gradient_norm": gradient,
         }
+        updated = apply_orbital_rotation(
+            seed, kappa, float(energy_at(h1e, eri, occ, kappa)), info=info
+        )
+        updated[0] = True
+        return updated, info
 
     def _follow_negative_mode(self, result):
-        h1e = np.asarray(result[5]).real
-        eri = np.asarray(result[6]).real
-        occ = np.asarray(result[4]).real
-        report = so.stability_analysis(h1e, eri, occ)
-        info = {
-            "negative_mode_eigenvalue": float(report["lowest"]),
-            "negative_mode_followed": False,
-            "negative_mode_energy_drop_hartree": None,
-        }
-        if report["lowest"] > -abs(self.settings.follow_mode_tol):
-            return result, False, info
-
-        before = energy_at(h1e, eri, occ)
-        _, kappa = minimize_orbitals(
-            h1e, eri, occ, 0.2 * np.asarray(report["lowest_mode"], dtype=float)
-        )
-        after = energy_at(h1e, eri, occ, kappa)
-        info["negative_mode_energy_drop_hartree"] = float(after - before)
-        if not (after < before - abs(self.settings.follow_mode_tol)):
-            return result, False, info
-        info["negative_mode_followed"] = True
-        return self._apply_orbital_rotation(result, kappa, after), True, info
+        return follow_negative_mode(result, self.settings.follow_mode_tol)
 
     def _embedding_record(self, solver) -> dict[str, Any]:
         singular = np.asarray(
@@ -280,44 +307,59 @@ class ActiveHamiltonianSurface:
             ))),
         }
 
+    def _checkpoint_meta(self, coords_bohr, key, evaluation) -> dict[str, Any]:
+        return {
+            "case": self.settings.case_name,
+            "fragment": int(self.settings.fragment),
+            "geometry_key": key,
+            "evaluation": int(evaluation),
+            "kmesh": np.asarray(self.settings.reference_kmesh, dtype=int),
+            "coords_bohr": np.asarray(coords_bohr, dtype=float),
+            "labels": list(self.labels),
+            "bath_rank_locked": int(self.fixed_n_bath is not None),
+        }
+
     def _write_hact_checkpoint(
         self, path, solver, result, energy, coords_bohr, key, evaluation
     ) -> bool:
-        import h5py
+        write_hact_checkpoint(
+            path,
+            meta=self._checkpoint_meta(coords_bohr, key, evaluation),
+            solver=solver,
+            result=result,
+            energy=energy,
+            checkpoint_eri=self.settings.checkpoint_eri,
+        )
+        return True
 
-        singular = getattr(solver, "bath_singular_values", None)
-        with h5py.File(path, "w") as handle:
-            group = handle.create_group("hact")
-            group["case"] = self.settings.case_name
-            group["fragment"] = int(self.settings.fragment)
-            group["geometry_key"] = key
-            group["evaluation"] = int(evaluation)
-            group["converged"] = int(bool(result[0]))
-            group["kmesh"] = np.asarray(self.settings.reference_kmesh, dtype=int)
-            group["coords_bohr"] = np.asarray(coords_bohr, dtype=float)
-            group["labels"] = np.asarray(self.labels, dtype=h5py.special_dtype(vlen=str))
-            group["e_tot"] = float(energy)
-            group["e_elec_active"] = float(result[1])
-            group["e1e_core"] = float(solver.E1e_core)
-            group["e2e_core"] = float(solver.E2e_core)
-            group["enuc"] = float(solver.Enuc)
-            group["core_energy_computed"] = 1
-            group["mo_coeff_active"] = np.asarray(result[3]).real
-            group["mo_occ_active"] = np.asarray(result[4]).real
-            group["mo_energy_active"] = np.asarray(result[2]).real
-            group["h1e_active"] = np.asarray(result[5]).real
-            if self.settings.checkpoint_eri and result[6] is not None:
-                group["eri_active"] = np.asarray(result[6]).real
-            group["mo_coeff_embedding"] = np.asarray(solver.mo_coeff).real
-            group["mo_occ_embedding"] = np.asarray(solver.mo_occ).real
-            group["active_orb"] = np.asarray(solver.active_orb, dtype=np.int8)
-            group["n_bath"] = int(solver.n_bath)
-            group["bath_rank_locked"] = int(self.fixed_n_bath is not None)
-            group["fragment_atoms"] = np.asarray(
-                sorted(solver.frag_atoms), dtype=int
-            )
-            if singular is not None:
-                group["bath_singular_values"] = np.asarray(singular, dtype=float)
+    def _write_hact_input_checkpoint(
+        self, path, solver, coords_bohr, key, evaluation, start_rotation, start_occ
+    ) -> bool:
+        settings = self.settings
+        meta = self._checkpoint_meta(coords_bohr, key, evaluation)
+        meta.update({
+            "basis": settings.basis,
+            "lattice_bohr": np.asarray(solver.scell.lattice_vectors(), dtype=float),
+            "spin": int(self.case.spin),
+            "charge": int(self.case.charge),
+            "vacancy_index": int(self.vacancy_index),
+        })
+        write_hact_input_checkpoint(
+            path,
+            meta=meta,
+            solver=solver,
+            checkpoint_eri=settings.checkpoint_eri,
+            scf={
+                "scf_conv_tol": float(settings.scf_conv_tol),
+                "scf_conv_tol_grad": float(settings.scf_conv_tol_grad),
+                "rescue_unconverged_scf": int(bool(settings.rescue_unconverged_scf)),
+                "rescue_tol_factor": float(settings.rescue_tol_factor),
+                "follow_negative_mode": int(bool(settings.follow_negative_mode)),
+                "follow_mode_tol": float(settings.follow_mode_tol),
+            },
+            start_rotation=start_rotation,
+            start_occ=start_occ,
+        )
         return True
 
     def energy(
@@ -577,8 +619,33 @@ class ActiveHamiltonianSurface:
             "negative_mode_eigenvalue": None,
             "negative_mode_followed": False,
             "negative_mode_energy_drop_hartree": None,
+            "orbitals_canonicalized": False,
+            "canonical_offdiagonal_fock_hartree": None,
             "hact_scf_continued_from_center": start_rotation is not None,
+            "input_checkpoint_saved": False,
         })
+
+        # Everything the frozen-bath SCF needs, written before it runs: a failed
+        # SCF can then be re-solved offline (hact_relax/resolve_hact.py) instead of
+        # repeating the pristine mean field and the embedding (docs/26).
+        # A failed write costs the retry option, never the evaluation.
+        input_chkfile = getattr(self.recorder, "hact_input_chkfile", None)
+        if accept_center and relax_active and input_chkfile is not None:
+            try:
+                with self.recorder.stage(
+                    "input_checkpoint_write", evaluation=evaluation, reason=reason
+                ):
+                    record["input_checkpoint_saved"] = (
+                        self._write_hact_input_checkpoint(
+                            input_chkfile, solver, coords_bohr, key, evaluation,
+                            start_rotation, start_occ,
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001 -- recorded and reported
+                record["input_checkpoint_error"] = "%s: %s" % (
+                    type(exc).__name__, exc)
+                print("# warning: hact_input.chk was not written (%s)"
+                      % record["input_checkpoint_error"], flush=True)
 
         if relax_active:
             with self.recorder.stage(
@@ -791,7 +858,9 @@ class ActiveHamiltonianSurface:
                 cell=solver.scell,
                 active_coeff=accepted_coeff,
                 active_occ=np.asarray(result[4]).real.copy(),
-                defect_index=defect_orbital_index(solver, accepted_coeff),
+                defect_index=defect_orbital_index(
+                    solver, accepted_coeff, np.asarray(result[4]).real
+                ),
             )
             if casci is not None:
                 if casci.ordered_active_coeff is None:

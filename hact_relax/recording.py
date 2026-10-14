@@ -204,6 +204,7 @@ class RunRecorder:
         self.config_path = self.output_dir / "config.json"
         self.pristine_chkfile = self.output_dir / "pristine.chk"
         self.hact_chkfile = self.output_dir / "hact.chk"
+        self.hact_input_chkfile = self.output_dir / "hact_input.chk"
 
         self._evaluations = JsonlWriter(self.evaluations_path)
         self._scf_iterations = JsonlWriter(self.scf_iterations_path)
@@ -281,6 +282,7 @@ class NullRecorder:
     output_dir = None
     pristine_chkfile = None
     hact_chkfile = None
+    hact_input_chkfile = None
     evaluation_count = 0
 
     def next_evaluation(self) -> int:

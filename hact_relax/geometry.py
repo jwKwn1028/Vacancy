@@ -12,7 +12,11 @@ from pyscf.geomopt import geometric_solver
 from hact_relax.cases import (
     BOHR,
     CASES,
+    CHAIN_ANIONS,
     CHAIN_CELLS,
+    HOST_LABELS,
+    LIF1D,
+    LIH1D,
     R_ANG,
     VacancyCase,
     fragment_relax_radius,
@@ -40,14 +44,18 @@ def ghost_species(label: str) -> str:
     return tail
 
 
-def pristine_chain_body(ncells: int = CHAIN_CELLS, r_ang: float = R_ANG) -> str:
+def pristine_chain_body(
+    ncells: int = CHAIN_CELLS, r_ang: float = R_ANG, *, host: str = LIH1D
+) -> str:
+    """Alternating Li/anion chain in Angstrom; the default remains LiH."""
+    anion = CHAIN_ANIONS[host]
     if int(ncells) < 1:
         raise ValueError("ncells must be positive")
     rows = []
     for cell_index in range(int(ncells)):
         x0 = 2.0 * float(r_ang) * cell_index
         rows.append("Li %.10f 0.0 0.0" % x0)
-        rows.append("H %.10f 0.0 0.0" % (x0 + float(r_ang)))
+        rows.append("%s %.10f 0.0 0.0" % (anion, x0 + float(r_ang)))
     return "\n".join(rows) + "\n"
 
 
@@ -55,13 +63,16 @@ def generated_starting_xyz(
     case_name: str, ncells: int = CHAIN_CELLS, r_ang: float = R_ANG
 ) -> str:
     case = CASES[case_name]
+    anion = CHAIN_ANIONS[case.host]
     ncell = int(ncells)
-    vacancy_index = 2 * (ncell // 2) + (1 if case.vacancy == "H" else 0)
-    body = get_vacancy_xyz(pristine_chain_body(ncell, r_ang), [vacancy_index])
+    vacancy_index = 2 * (ncell // 2) + (1 if case.vacancy == anion else 0)
+    body = get_vacancy_xyz(
+        pristine_chain_body(ncell, r_ang, host=case.host), [vacancy_index]
+    )
     body = body.replace("Ghost:", "GHOST-")
     comment = (
-        "LiH-1D R=%.3f A, cells=%d, full-chain kmesh=1x1x1, one %s vacancy"
-        % (r_ang, ncell, case.vacancy)
+        "%s R=%.3f A, cells=%d, full-chain kmesh=1x1x1, one %s vacancy"
+        % (HOST_LABELS[case.host], r_ang, ncell, case.vacancy)
     )
     return "%d\n%s\n%s\n" % (2 * ncell, comment, body)
 
@@ -206,12 +217,27 @@ def ideal_supercell(primitive_atoms, primitive_lattice, kmesh):
     return symbols, coords
 
 
+def chain_primitive_cell(
+    r_ang: float = R_ANG, vacuum_ang: float = 30.0, *, host: str = LIH1D
+) -> tuple[list, np.ndarray]:
+    """The 2-atom Li/anion cell as ([symbol, xyz], lattice), Bohr."""
+    atoms = [["Li", np.zeros(3)],
+             [CHAIN_ANIONS[host], np.array([float(r_ang) / BOHR, 0.0, 0.0])]]
+    return atoms, full_chain_lattice(1, r_ang, vacuum_ang)
+
+
 def lih_primitive_cell(
     r_ang: float = R_ANG, vacuum_ang: float = 30.0
 ) -> tuple[list, np.ndarray]:
     """The 2-atom LiH-1D cell as ([symbol, xyz], lattice), Bohr."""
-    atoms = [["Li", np.zeros(3)], ["H", np.array([float(r_ang) / BOHR, 0.0, 0.0])]]
-    return atoms, full_chain_lattice(1, r_ang, vacuum_ang)
+    return chain_primitive_cell(r_ang, vacuum_ang, host=LIH1D)
+
+
+def lif_primitive_cell(
+    r_ang: float = R_ANG, vacuum_ang: float = 30.0
+) -> tuple[list, np.ndarray]:
+    """The 2-atom LiF-1D cell as ([symbol, xyz], lattice), Bohr."""
+    return chain_primitive_cell(r_ang, vacuum_ang, host=LIF1D)
 
 
 def hbn_primitive_cell(

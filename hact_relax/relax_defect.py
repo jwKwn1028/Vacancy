@@ -18,12 +18,12 @@ from pyscf import lib
 from frozen_bath_scf.schmidt_embedding import DEFAULT_BATH_TOL
 from hact_relax.cases import (
     CASES,
+    CHAIN_ANIONS,
     CHAIN_CELLS,
     HBN2D,
     HOST_DEFAULT_BASIS,
     HOST_DEFAULT_FD_AXES,
     HOST_FRAGMENTS,
-    LIH1D,
     R_ANG,
     case_host,
     parse_cases,
@@ -35,9 +35,11 @@ from system.hbn import A_HBN, HBN_CELLS
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Relax LiH-1D or hBN-2D vacancies on the embedded H_act^V "
+        description="Relax LiH-1D, LiF-1D or hBN-2D vacancies on the embedded H_act^V "
                     "surface.  Cases: vhn, vhc, vln, vlc (LiH-1D; 'all' means "
-                    "these four) and vbc (hBN-2D V_B-)"
+                    "these four), lif-vfn/lif-vfc (LiF-1D F vacancy, neutral/-1), "
+                    "lif-vln/lif-vlc (LiF-1D Li vacancy, neutral/-1), "
+                    "and vbc (hBN-2D V_B-)"
     )
     parser.add_argument("cases", nargs="?", default="all")
     parser.add_argument("fragments", nargs="?", default="all")
@@ -45,15 +47,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xyz", type=Path)
     parser.add_argument("--output-dir", type=Path, default=REPO / "result")
     parser.add_argument("--basis", default=None,
-                        help="defaults to pob-tzvp for LiH-1D and cc-pvdz for "
-                             "hBN-2D, the paper's choices")
+                        help="defaults to pob-tzvp for LiH-1D/LiF-1D and cc-pvdz for "
+                             "hBN-2D")
     parser.add_argument("--chain-cells", type=int, default=CHAIN_CELLS,
-                        help="LiH-1D: cells in the Gamma chain")
+                        help="LiH-1D/LiF-1D: cells in the Gamma chain")
     parser.add_argument("--lattice-r", type=float, default=R_ANG,
-                        help="LiH-1D: Li-H distance, Angstrom")
+                        help="LiH-1D/LiF-1D: Li-H or Li-F distance, Angstrom "
+                             "(default %(default)s for either chain)")
     parser.add_argument("--hbn-cells", type=int, default=HBN_CELLS,
                         help="hBN-2D: the Gamma supercell is N x N primitive "
-                             "cells (default %(default)s = the paper's 162 atoms)")
+                             "cells (default %(default)s = 162 atoms)")
     parser.add_argument("--hbn-a", type=float, default=A_HBN,
                         help="hBN-2D: in-plane lattice constant, Angstrom")
     parser.add_argument("--wrap-about-vacancy",
@@ -63,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "terms, which are not lattice-summed.  Defaults "
                              "on for hBN-2D, whose 60-degree supercell is a "
                              "rhombus rather than the hexagon of nearest images, "
-                             "and off for LiH-1D, whose vacancy is mid-chain")
+                             "and off for LiH-1D/LiF-1D, whose vacancy is mid-chain")
     parser.add_argument("--vacuum", type=float, default=30.0)
     parser.add_argument("--reference", choices=("gamma", "kmesh"),
                         default="gamma",
@@ -130,8 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="how the CAS window is chosen at the first centre: "
                              "population on the vacancy site, or the Fock-energy "
                              "frontier.  Defaults to the case's choice: "
-                             "vacancy-local for LiH, energy for hBN, whose "
-                             "dangling bonds sit on the nitrogens")
+                             "vacancy-local for LiH, energy for LiF and hBN")
     parser.add_argument("--cas-energy-gap-tol", type=float, default=1e-4,
                         help="with --cas-selection energy, the smallest orbital-"
                              "energy gap (Ha) allowed at either edge of the "
@@ -140,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fd-step", type=float, default=1e-3)
     parser.add_argument("--fd-axes", default=None,
                         help="Cartesian axes of the central differences; "
-                             "defaults to x for LiH-1D and xy for hBN-2D")
+                             "defaults to x for LiH-1D/LiF-1D and xy for hBN-2D")
     parser.add_argument("--fd-mode", default="central",
                         choices=("central", "forward"))
     parser.add_argument("--max-gradient", type=float, default=1.0)
@@ -265,7 +267,7 @@ def validate_args(parser: argparse.ArgumentParser, args):
     if args.xyz is not None and len(cases) * len(fragments) != 1:
         parser.error("--xyz can only describe one case/fragment combination")
     largest = max(fragments)
-    if host == LIH1D:
+    if host in CHAIN_ANIONS:
         if args.chain_cells < 1:
             parser.error("--chain-cells must be positive")
         if args.lattice_r <= 0.0:
@@ -281,7 +283,7 @@ def validate_args(parser: argparse.ArgumentParser, args):
         if args.hbn_a <= 0.0:
             parser.error("--hbn-a must be positive")
         if args.seed_displace != 0.0:
-            parser.error("--seed-displace is defined for the LiH chain only")
+            parser.error("--seed-displace is defined for LiH and LiF chains only")
         natm = 2 * args.hbn_cells ** 2
         if largest > natm:
             parser.error(

@@ -12,9 +12,11 @@ from pyscf.geomopt.addons import as_pyscf_method
 
 from hact_relax.cases import (
     CASES,
+    CHAIN_ANIONS,
     FULL_CHAIN_KMESH,
     HBN2D,
     HOST_DEFAULT_WRAP,
+    HOST_LABELS,
     fragment_relax_radius,
 )
 from hact_relax.errors import GeometryOptimizationNotConverged
@@ -23,6 +25,7 @@ from hact_relax.geometry import (
     build_driver_molecule,
     build_hbn_starting_geometry,
     build_starting_geometry,
+    chain_primitive_cell,
     check_geometry_fits_lattice,
     check_geometry_fits_supercell,
     fragment_movable_atoms,
@@ -31,7 +34,6 @@ from hact_relax.geometry import (
     hbn_lattice,
     hbn_primitive_cell,
     ideal_supercell,
-    lih_primitive_cell,
     snap_to_ideal_lattice,
     movable_atoms,
     patch_geometric_for_ghost_atoms,
@@ -94,13 +96,17 @@ def _check_ghost_site(labels, vacancy_index, case, input_description) -> None:
 
 
 def _lih_geometry(args, case_name, fragment, input_xyz):
+    """Build a LiH or LiF chain (keep the original helper name for callers)."""
     case = CASES[case_name]
+    host_label = HOST_LABELS[case.host]
     chain_cells = int(args.chain_cells)
     if input_xyz is None:
         labels, coords_bohr, vacancy_index = build_starting_geometry(
             case_name, chain_cells, args.lattice_r
         )
-        input_description = "generated LiH-1D + central %s vacancy" % case.vacancy
+        input_description = "generated %s + central %s vacancy" % (
+            host_label, case.vacancy
+        )
     else:
         labels, coords_bohr, vacancy_index = read_xyz(input_xyz)
         input_description = os.fspath(input_xyz)
@@ -109,8 +115,18 @@ def _lih_geometry(args, case_name, fragment, input_xyz):
     expected_natm = 2 * chain_cells
     if len(labels) != expected_natm:
         raise ValueError(
-            "%s has %d atoms; a %d-cell full LiH chain requires %d atoms"
-            % (input_description, len(labels), chain_cells, expected_natm)
+            "%s has %d atoms; a %d-cell full %s chain requires %d atoms"
+            % (input_description, len(labels), chain_cells,
+               host_label.removesuffix("-1D"), expected_natm)
+        )
+    species = sorted(ghost_species(label).lower() for label in labels)
+    expected_species = sorted(["li", CHAIN_ANIONS[case.host].lower()] * chain_cells)
+    if species != expected_species:
+        raise ValueError(
+            "%s must contain %d Li and %d %s sites, including the ghost, "
+            "for a %s chain"
+            % (input_description, chain_cells, chain_cells,
+               CHAIN_ANIONS[case.host], host_label)
         )
     if fragment > expected_natm:
         raise ValueError(
@@ -179,7 +195,7 @@ def _hbn_geometry(args, case_name, fragment, input_xyz):
             % (fragment, expected_natm)
         )
     if args.seed_displace != 0.0:
-        raise ValueError("--seed-displace is defined for the LiH chain only")
+        raise ValueError("--seed-displace is defined for LiH and LiF chains only")
     shortest_ang = check_geometry_fits_supercell(
         coords_bohr, lattice_bohr, input_description
     )
@@ -220,7 +236,9 @@ def _pristine_reference(args, case, labels, coords_bohr, input_description):
         atoms, lattice = hbn_primitive_cell(args.hbn_a, args.vacuum)
         kmesh = (int(args.hbn_cells), int(args.hbn_cells), 1)
     else:
-        atoms, lattice = lih_primitive_cell(args.lattice_r, args.vacuum)
+        atoms, lattice = chain_primitive_cell(
+            args.lattice_r, args.vacuum, host=case.host
+        )
         kmesh = (int(args.chain_cells), 1, 1)
     symbols, ideal = ideal_supercell(atoms, lattice, kmesh)
     coords_bohr = snap_to_ideal_lattice(

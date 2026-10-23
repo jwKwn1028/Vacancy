@@ -238,7 +238,7 @@ class _SchmidtEmbedding:
         else:
             # On a k-mesh the one-body terms below are unfolded from the k-point
             # mean field, so they share the pristine energy's integrals and need
-            # no supercell GDF (docs/20).
+            # no supercell GDF.
             gdf = self._kmesh_periodic_gdf(scell)
         self.gdf = gdf
 

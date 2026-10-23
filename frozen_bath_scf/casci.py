@@ -1,6 +1,6 @@
 """CASCI on the embedded active-space Hamiltonian.
 
-``H_act^V`` (defect.pdf Eq. 14) is handed to us as an MO-basis one-electron matrix
+``H_act^V`` is handed to us as an MO-basis one-electron matrix
 ``h1e``, the active two-electron integrals ``eri``, and the core energy
 ``E1e_core + E2e_core + Enuc``.  PySCF's CASCI wants a mean-field object, so we wrap
 those in a dummy ``scf.RHF`` whose "AO" basis already IS the relaxed active-MO basis.

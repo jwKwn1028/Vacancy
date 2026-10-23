@@ -627,7 +627,7 @@ class ActiveHamiltonianSurface:
 
         # Everything the frozen-bath SCF needs, written before it runs: a failed
         # SCF can then be re-solved offline (hact_relax/resolve_hact.py) instead of
-        # repeating the pristine mean field and the embedding (docs/26).
+        # repeating the pristine mean field and the embedding.
         # A failed write costs the retry option, never the evaluation.
         input_chkfile = getattr(self.recorder, "hact_input_chkfile", None)
         if accept_center and relax_active and input_chkfile is not None:

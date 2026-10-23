@@ -12,14 +12,18 @@ R_ANG = 1.7
 FRAGMENTS = (1, 3, 5, 7, 9)
 
 LIH1D = "lih1d"
+LIF1D = "lif1d"
 HBN2D = "hbn2d"
+CHAIN_ANIONS = {LIH1D: "H", LIF1D: "F"}
+HOST_LABELS = {LIH1D: "LiH-1D", LIF1D: "LiF-1D", HBN2D: "hBN-2D"}
 HOST_FRAGMENTS = {
     LIH1D: FRAGMENTS,
+    LIF1D: FRAGMENTS,
     HBN2D: (1, 4, 10, 13, 19),
 }
-HOST_DEFAULT_BASIS = {LIH1D: "pob-tzvp", HBN2D: "cc-pvdz"}
-HOST_DEFAULT_FD_AXES = {LIH1D: "x", HBN2D: "xy"}
-HOST_DEFAULT_WRAP = {LIH1D: False, HBN2D: True}
+HOST_DEFAULT_BASIS = {LIH1D: "pob-tzvp", LIF1D: "pob-tzvp", HBN2D: "cc-pvdz"}
+HOST_DEFAULT_FD_AXES = {LIH1D: "x", LIF1D: "x", HBN2D: "xy"}
+HOST_DEFAULT_WRAP = {LIH1D: False, LIF1D: False, HBN2D: True}
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,17 @@ CASES = {
     "vlc": VacancyCase("Li", -1, 0, True, 8, 6, 0.4),
     "vbc": VacancyCase("B", -1, 2, False, 6, 10, 0.4, host=HBN2D,
                        cas_selection="energy"),
+    # LiF keeps the LiH charge/spin conventions. Frontier CAS windows include
+    # neighbour orbitals whose ghost population can fall below the locality
+    # threshold. CAS sizes remain CLI-overridable.
+    "lif-vfn": VacancyCase("F", 0, 1, False, 6, 5, 0.1, host=LIF1D,
+                           cas_selection="energy"),
+    "lif-vfc": VacancyCase("F", -1, 2, True, 6, 6, 0.4, host=LIF1D,
+                           cas_selection="energy"),
+    "lif-vln": VacancyCase("Li", 0, 1, False, 8, 7, 0.2, host=LIF1D,
+                           cas_selection="energy"),
+    "lif-vlc": VacancyCase("Li", -1, 0, True, 8, 8, 0.4, host=LIF1D,
+                           cas_selection="energy"),
 }
 
 

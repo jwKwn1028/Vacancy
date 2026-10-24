@@ -38,7 +38,6 @@ from hact_relax.geometry import (
     movable_atoms,
     patch_geometric_for_ghost_atoms,
     read_xyz,
-    seed_displace_from_vacancy,
     write_xyz,
 )
 from hact_relax.gradient import (
@@ -137,9 +136,6 @@ def _lih_geometry(args, case_name, fragment, input_xyz):
         coords_bohr, chain_cells, args.lattice_r, input_description
     )
 
-    coords_bohr = seed_displace_from_vacancy(
-        coords_bohr, vacancy_index, args.seed_displace
-    )
     movable = movable_atoms(
         labels, coords_bohr, vacancy_index, fragment, args.lattice_r
     )
@@ -194,8 +190,6 @@ def _hbn_geometry(args, case_name, fragment, input_xyz):
             "fragment size %d exceeds the %d-atom supercell"
             % (fragment, expected_natm)
         )
-    if args.seed_displace != 0.0:
-        raise ValueError("--seed-displace is defined for LiH and LiF chains only")
     shortest_ang = check_geometry_fits_supercell(
         coords_bohr, lattice_bohr, input_description
     )
@@ -221,6 +215,15 @@ def _hbn_geometry(args, case_name, fragment, input_xyz):
             lattice_bohr, fields)
 
 
+def _primitive_crystal(args, case):
+    """(atoms, lattice, k-mesh) of the 2-atom cell that unfolds to the supercell."""
+    if case.host == HBN2D:
+        atoms, lattice = hbn_primitive_cell(args.hbn_a, args.vacuum)
+        return atoms, lattice, (int(args.hbn_cells), int(args.hbn_cells), 1)
+    atoms, lattice = chain_primitive_cell(args.lattice_r, args.vacuum, host=case.host)
+    return atoms, lattice, (int(args.chain_cells), 1, 1)
+
+
 def _pristine_reference(args, case, labels, coords_bohr, input_description):
     """(coords, kmesh, primitive atoms, primitive lattice) of the pristine reference.
 
@@ -232,14 +235,7 @@ def _pristine_reference(args, case, labels, coords_bohr, input_description):
     """
     if getattr(args, "reference", "gamma") != "kmesh":
         return coords_bohr, FULL_CHAIN_KMESH, None, None
-    if case.host == HBN2D:
-        atoms, lattice = hbn_primitive_cell(args.hbn_a, args.vacuum)
-        kmesh = (int(args.hbn_cells), int(args.hbn_cells), 1)
-    else:
-        atoms, lattice = chain_primitive_cell(
-            args.lattice_r, args.vacuum, host=case.host
-        )
-        kmesh = (int(args.chain_cells), 1, 1)
+    atoms, lattice, kmesh = _primitive_crystal(args, case)
     symbols, ideal = ideal_supercell(atoms, lattice, kmesh)
     coords_bohr = snap_to_ideal_lattice(
         labels, coords_bohr, symbols, ideal, input_description
@@ -314,7 +310,6 @@ def run_configuration(
         "auxbasis": None,
         **geometry_fields,
         "vacuum_ang": float(args.vacuum),
-        "seed_displace_ang": float(args.seed_displace),
         "input_xyz": None if args.xyz is None else os.fspath(args.xyz),
         "input_geometry": input_description,
         "output_dir": os.fspath(output_dir),
@@ -391,6 +386,14 @@ def run_one(
             "pristine primitive-cell KRHF on the reference k-mesh, unfolded to "
             "the supercell by the embedding (ideal lattice only)"
         )
+    split_atoms = split_lattice = split_kmesh = None
+    if getattr(args, "split", False):
+        split_atoms, split_lattice, split_kmesh = _primitive_crystal(args, case)
+        geometry_fields["split_kmesh"] = list(split_kmesh)
+        geometry_fields["periodic_scf"] = (
+            "Gamma KRHF of the supercell; ERIs with all four AOs outside the "
+            "fragment from the ideal crystal's k-point GDF (--split)"
+        )
     if not movable:
         raise ValueError("no real atoms selected for relaxation")
 
@@ -441,6 +444,9 @@ def run_one(
         wrap_about_vacancy=_wrap_about_vacancy(args, case),
         primitive_atoms=primitive_atoms,
         primitive_lattice_bohr=primitive_lattice,
+        split_kmesh=split_kmesh,
+        split_primitive_atoms=split_atoms,
+        split_primitive_lattice_bohr=split_lattice,
     )
     driver_mol = build_driver_molecule(
         labels, coords_bohr, case, args.basis, args.memory_mb, args.verbose

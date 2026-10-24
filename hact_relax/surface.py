@@ -20,6 +20,8 @@ from frozen_bath_scf.schmidt_embedding import (
     SchmidtEmbeddedROHF,
 )
 from system.pristine import build_pristine_mean_field
+from system.shells import nearest_atoms
+from system.split_fit import KpointOutside
 
 from hact_relax.cases import CASES
 from hact_relax.checkpoint import write_hact_checkpoint, write_hact_input_checkpoint
@@ -28,7 +30,7 @@ from hact_relax.errors import (
     SCFNotConverged,
     SubspaceContinuityError,
 )
-from hact_relax.geometry import ideal_supercell, restored_pristine_atoms
+from hact_relax.geometry import ghost_species, ideal_supercell, restored_pristine_atoms
 from hact_relax.recording import NullRecorder
 from hact_relax.tracking import (
     ActiveSolutionReference,
@@ -164,6 +166,9 @@ class SurfaceSettings:
     wrap_about_vacancy: bool = False
     primitive_atoms: list | None = None
     primitive_lattice_bohr: np.ndarray | None = None
+    split_kmesh: tuple[int, int, int] | None = None
+    split_primitive_atoms: list | None = None
+    split_primitive_lattice_bohr: np.ndarray | None = None
 
 
 class ActiveHamiltonianSurface:
@@ -200,6 +205,22 @@ class ActiveHamiltonianSurface:
                 settings.primitive_atoms, settings.primitive_lattice_bohr,
                 settings.reference_kmesh,
             )
+        self.split_outside: KpointOutside | None = None
+        self.split_ideal_coords: np.ndarray | None = None
+        self.split_atoms: tuple[int, ...] | None = None
+        if settings.split_kmesh is not None:
+            symbols, self.split_ideal_coords = ideal_supercell(
+                settings.split_primitive_atoms, settings.split_primitive_lattice_bohr,
+                settings.split_kmesh,
+            )
+            if [ghost_species(x).lower() for x in self.labels] != [
+                    str(x).lower() for x in symbols]:
+                raise ValueError("--split: the geometry does not list its atoms in "
+                                 "the order of the ideal k-mesh supercell")
+            self.split_atoms = tuple(int(i) for i in nearest_atoms(
+                self.split_ideal_coords, self.lattice_bohr, self.vacancy_index,
+                settings.fragment,
+            ))
 
     @staticmethod
     def _key(coords_bohr: np.ndarray) -> str:
@@ -226,6 +247,50 @@ class ActiveHamiltonianSurface:
             )
 
     _apply_orbital_rotation = staticmethod(apply_orbital_rotation)
+
+    def _split_moved_atoms(self, coords_bohr: np.ndarray) -> list[int]:
+        shift = np.asarray(coords_bohr) - self.split_ideal_coords
+        frac = shift @ np.linalg.inv(self.lattice_bohr)
+        shift = (frac - np.round(frac)) @ self.lattice_bohr
+        return [int(i) for i in np.where(np.linalg.norm(shift, axis=1) > 1e-6)[0]]
+
+    def _split_integrals(self, coords_bohr, reason, evaluation, record):
+        moved = self._split_moved_atoms(coords_bohr)
+        outside = sorted(set(moved) - set(self.split_atoms))
+        if outside:
+            raise ValueError(
+                "%s: --split takes the integrals outside the fragment %s from the "
+                "ideal crystal, but atoms %s outside it have moved"
+                % (reason, list(self.split_atoms), outside)
+            )
+        if self.split_outside is None:
+            settings = self.settings
+            with self.recorder.stage(
+                "split_kpoint_scf", evaluation=evaluation, reason=reason
+            ):
+                _, kmf = build_pristine_mean_field(
+                    settings.split_primitive_atoms,
+                    settings.split_primitive_lattice_bohr,
+                    settings.basis,
+                    kmesh=settings.split_kmesh,
+                    exxdiv=None,
+                    verbose=settings.verbose,
+                    max_memory=settings.memory_mb,
+                    conv_tol=settings.scf_conv_tol,
+                    conv_tol_grad=settings.scf_conv_tol_grad,
+                    max_cycle=settings.scf_max_cycle,
+                    auxbasis=settings.auxbasis,
+                )
+                self.split_outside = KpointOutside(kmf, settings.split_kmesh)
+                del kmf
+                gc.collect()
+        record.update({
+            "pristine_reference": "split",
+            "split_kmesh": list(self.settings.split_kmesh),
+            "split_fragment_atoms": list(self.split_atoms),
+            "split_moved_atoms": moved,
+        })
+        return self.split_outside, self.split_atoms
 
     def _rescue_limit(self) -> float:
         return self.settings.scf_conv_tol_grad * self.settings.rescue_tol_factor
@@ -458,6 +523,13 @@ class ActiveHamiltonianSurface:
         else:
             pristine_atoms = settings.primitive_atoms
             pristine_lattice = settings.primitive_lattice_bohr
+        split = None
+        if self.split_atoms is not None:
+            split = self._split_integrals(coords_bohr, reason, evaluation, record)
+        if prior_pristine is not None:
+            dm0 = prior_pristine.density
+        else:
+            dm0 = None if split is None else split[0].density
         # On a k-mesh the KRHF energy is per primitive cell.
         ncells = int(np.prod(settings.reference_kmesh))
         with self.recorder.stage(
@@ -478,10 +550,11 @@ class ActiveHamiltonianSurface:
                 conv_tol_grad=settings.scf_conv_tol_grad,
                 max_cycle=settings.scf_max_cycle,
                 auxbasis=settings.auxbasis,
-                dm0=None if prior_pristine is None else prior_pristine.density,
+                dm0=dm0,
                 callback=pristine_callback,
                 chkfile=(self.recorder.pristine_chkfile
                          if accept_center else None),
+                split=split,
             )
         record.update({
             "pristine_energy_hartree": float(pristine_kmf.e_tot) * ncells,

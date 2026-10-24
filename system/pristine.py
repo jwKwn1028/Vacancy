@@ -52,6 +52,7 @@ def build_pristine_mean_field(
     auxbasis=None,
     callback=None,
     chkfile=None,
+    split=None,
 ):
     from pyscf.pbc import gto, scf
 
@@ -69,6 +70,13 @@ def build_pristine_mean_field(
 
     kpts = cell.make_kpts(list(kmesh))
     kmf = scf.KRHF(cell, kpts, exxdiv=exxdiv).density_fit(auxbasis=auxbasis)
+    if split is not None:
+        from system.split_fit import SplitDensityFit, fragment_aos
+
+        if len(kpts) != 1:
+            raise ValueError("split integrals need the Gamma supercell")
+        outside, atoms = split
+        kmf.with_df = SplitDensityFit(kmf.with_df, outside, fragment_aos(cell, atoms))
     kmf.conv_tol = float(conv_tol)
     kmf.conv_tol_grad = float(conv_tol_grad)
     kmf.max_cycle = int(max_cycle)

@@ -77,7 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "the supercell density fitting.  The "
                              "k-mesh is the perfect crystal, so it needs the "
                              "ideal lattice and --single-point --energy-only")
-    parser.add_argument("--seed-displace", type=float, default=0.0)
+    parser.add_argument("--split", action="store_true",
+                        help="Gamma reference whose ERIs outside the fragment "
+                             "come from the ideal crystal's k-point GDF")
     parser.add_argument("--coordsys", default="cart",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
 
@@ -201,8 +203,8 @@ def validate_args(parser: argparse.ArgumentParser, args):
             "displacements and relaxation steps break its periodicity, so it needs "
             "--single-point --energy-only"
         )
-    if args.reference == "kmesh" and args.seed_displace != 0.0:
-        parser.error("--reference kmesh needs the ideal lattice; drop --seed-displace")
+    if args.split and args.reference != "gamma":
+        parser.error("--split is a Gamma reference; drop --reference kmesh")
     if args.memory_mb < 1 or args.fd_step <= 0 or args.maxsteps < 1:
         parser.error("--memory-mb, --fd-step and --maxsteps must be positive")
     if args.max_gradient <= 0.0 or args.bath_tol <= 0.0:
@@ -282,8 +284,6 @@ def validate_args(parser: argparse.ArgumentParser, args):
             parser.error("--hbn-cells must be positive")
         if args.hbn_a <= 0.0:
             parser.error("--hbn-a must be positive")
-        if args.seed_displace != 0.0:
-            parser.error("--seed-displace is defined for LiH and LiF chains only")
         natm = 2 * args.hbn_cells ** 2
         if largest > natm:
             parser.error(

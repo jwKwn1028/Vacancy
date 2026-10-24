@@ -358,20 +358,6 @@ def movable_atoms(
     return [i for i in candidates if distance[i] * BOHR <= radius_ang + 1e-12]
 
 
-def seed_displace_from_vacancy(
-    coords_bohr: np.ndarray, vacancy_index: int, displacement_ang: float
-) -> np.ndarray:
-    coords = np.asarray(coords_bohr, dtype=float).copy()
-    if displacement_ang == 0.0:
-        return coords
-    displacement_bohr = displacement_ang / BOHR
-    vacancy_x = coords[vacancy_index, 0]
-    coords[coords[:, 0] < vacancy_x, 0] -= displacement_bohr
-    coords[coords[:, 0] > vacancy_x, 0] += displacement_bohr
-    coords[vacancy_index] = np.asarray(coords_bohr)[vacancy_index]
-    return coords
-
-
 def patch_geometric_for_ghost_atoms() -> None:
     base = geometric_solver.PySCFEngine
     if getattr(base, "_hact_ghost_safe", False):

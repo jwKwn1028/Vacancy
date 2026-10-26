@@ -118,10 +118,11 @@ def main(argv=None) -> int:
     }
     if not result[0] and settings["rescue_unconverged_scf"]:
         limit = settings["scf_conv_tol_grad"] * settings["rescue_tol_factor"]
-        result, rescue = rescue_unconverged(result, limit)
+        result, rescue = rescue_unconverged(result, limit, settings["scf_conv_tol_grad"])
         report.update(rescue)
     if result[0] and settings["follow_negative_mode"]:
-        result, _, mode = follow_negative_mode(result, settings["follow_mode_tol"])
+        result, _, mode = follow_negative_mode(result, settings["follow_mode_tol"],
+                                               settings["scf_conv_tol_grad"])
         report.update(mode)
 
     report["converged"] = bool(result[0])

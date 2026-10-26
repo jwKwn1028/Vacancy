@@ -13,6 +13,7 @@ from frozen_bath_scf.orbital_optimizer import (
     canonical_block_rotation,
     energy_at,
     minimize_orbitals,
+    newton_finish,
     rotate_hamiltonian,
 )
 from frozen_bath_scf.schmidt_embedding import (
@@ -45,13 +46,14 @@ from hact_relax.tracking import (
 )
 
 
-def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=None):
-    """``result`` with its active orbitals rotated by exp(kappa).
+def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=None,
+                           rotation=None):
+    """``result`` with its active orbitals rotated by exp(kappa), or by ``rotation``.
     """
     h1e = np.asarray(result[5]).real
     eri = np.asarray(result[6]).real
     occ = np.asarray(result[4]).real
-    u = so._expm_antisym(kappa)
+    u = so._expm_antisym(kappa) if rotation is None else np.asarray(rotation)
     dm_a, dm_b = so.densities(occ)
     v_a, v_b = so.general_veff(eri, u @ dm_a @ u.T, u @ dm_b @ u.T)
     fock = so._rotate(h1e + 0.5 * (v_a + v_b), u)
@@ -73,8 +75,23 @@ def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=Non
     return updated
 
 
-def rescue_unconverged(result, gradient_limit):
-    """Finish an unconverged frozen-bath SCF by L-BFGS at fixed occupations.
+def minimize_and_finish(h1e, eri, occ, x0, newton_tol):
+    """L-BFGS at fixed occupations from ``x0``, then a Newton finish to an orbital
+    gradient of ``newton_tol`` (orbital_optimizer.newton_finish).  Returns the rotation,
+    its energy, the final gradient norm and the Newton record."""
+    _, kappa = minimize_orbitals(h1e, eri, occ, x0)
+    u = so._expm_antisym(kappa)
+    h1e, eri = rotate_hamiltonian(h1e, eri, u)
+    lbfgs = float(np.linalg.norm(so.orbital_gradient(h1e, eri, occ)))
+    v, h1e, eri, newton = newton_finish(h1e, eri, occ, newton_tol)
+    newton["lbfgs_gradient_norm"] = lbfgs
+    return (u @ v, float(energy_at(h1e, eri, occ)), newton["newton_gradient_after"],
+            newton)
+
+
+def rescue_unconverged(result, gradient_limit, newton_tol=None):
+    """Finish an unconverged frozen-bath SCF at fixed occupations (minimize_and_finish,
+    Newton to ``newton_tol``, default ``gradient_limit``).
 
     Accepted when the final orbital gradient is at most ``gradient_limit``; the
     accepted solution is canonical (``apply_orbital_rotation``).
@@ -84,22 +101,25 @@ def rescue_unconverged(result, gradient_limit):
     h1e = np.asarray(result[5]).real
     eri = np.asarray(result[6]).real
     occ = np.asarray(result[4]).real
-    _, kappa = minimize_orbitals(
-        h1e, eri, occ, np.zeros(int(so.rotation_mask(occ).sum()))
+    u, energy, gradient, newton = minimize_and_finish(
+        h1e, eri, occ, np.zeros(int(so.rotation_mask(occ).sum())),
+        gradient_limit if newton_tol is None else newton_tol,
     )
-    gradient = float(np.linalg.norm(so.orbital_gradient(h1e, eri, occ, kappa)))
-    if gradient > gradient_limit:
-        return result, {"scf_rescued": False, "scf_rescue_gradient_norm": gradient}
-    info = {"scf_rescued": True, "scf_rescue_gradient_norm": gradient}
-    updated = apply_orbital_rotation(
-        result, kappa, float(energy_at(h1e, eri, occ, kappa)), info=info
-    )
+    info = {"scf_rescued": gradient <= gradient_limit,
+            "scf_rescue_gradient_norm": gradient,
+            "scf_rescue_lbfgs_gradient_norm": newton["lbfgs_gradient_norm"],
+            "scf_rescue_newton_cycles": newton["newton_cycles"],
+            "scf_rescue_newton_stop": newton["newton_stop"]}
+    if not info["scf_rescued"]:
+        return result, info
+    updated = apply_orbital_rotation(result, None, energy, info=info, rotation=u)
     updated[0] = True
     return updated, info
 
 
-def follow_negative_mode(result, tol):
-    """Follow the lowest orbital-Hessian mode if it is below -``tol``.
+def follow_negative_mode(result, tol, newton_tol=1e-9):
+    """Follow the lowest orbital-Hessian mode if it is below -``tol``, to a minimum
+    finished by Newton steps to an orbital gradient of ``newton_tol``.
 
     Returns the result, whether a mode was followed, and the record fields.  A
     followed solution is canonical (``apply_orbital_rotation``).
@@ -117,15 +137,21 @@ def follow_negative_mode(result, tol):
         return result, False, info
 
     before = energy_at(h1e, eri, occ)
-    _, kappa = minimize_orbitals(
-        h1e, eri, occ, 0.2 * np.asarray(report["lowest_mode"], dtype=float)
+    u, after, gradient, newton = minimize_and_finish(
+        h1e, eri, occ, 0.2 * np.asarray(report["lowest_mode"], dtype=float), newton_tol
     )
-    after = energy_at(h1e, eri, occ, kappa)
-    info["negative_mode_energy_drop_hartree"] = float(after - before)
+    info.update({
+        "negative_mode_energy_drop_hartree": float(after - before),
+        "negative_mode_gradient_norm": gradient,
+        "negative_mode_lbfgs_gradient_norm": newton["lbfgs_gradient_norm"],
+        "negative_mode_newton_cycles": newton["newton_cycles"],
+        "negative_mode_newton_stop": newton["newton_stop"],
+    })
     if not (after < before - abs(tol)):
         return result, False, info
     info["negative_mode_followed"] = True
-    return apply_orbital_rotation(result, kappa, after, info=info), True, info
+    return (apply_orbital_rotation(result, None, after, info=info, rotation=u), True,
+            info)
 
 
 @dataclass
@@ -296,7 +322,8 @@ class ActiveHamiltonianSurface:
         return self.settings.scf_conv_tol_grad * self.settings.rescue_tol_factor
 
     def _rescue_unconverged_scf(self, result):
-        return rescue_unconverged(result, self._rescue_limit())
+        return rescue_unconverged(result, self._rescue_limit(),
+                                  self.settings.scf_conv_tol_grad)
 
     def _converge_on_center_branch(self, solver, result, start_rotation, start_occ):
         if start_rotation is None or start_occ is None:
@@ -306,17 +333,19 @@ class ActiveHamiltonianSurface:
         h1e = np.asarray(solver.get_hcore(solver.heff, u0)).real
         _, eri = solver.get_veff(occ, solver.eri_active, u0)
         eri = np.asarray(eri).real
-        _, kappa = minimize_orbitals(
-            h1e, eri, occ, np.zeros(int(so.rotation_mask(occ).sum()))
+        u, energy, gradient, newton = minimize_and_finish(
+            h1e, eri, occ, np.zeros(int(so.rotation_mask(occ).sum())),
+            self.settings.scf_conv_tol_grad,
         )
-        gradient = float(np.linalg.norm(
-            so.orbital_gradient(h1e, eri, occ, kappa)
-        ))
-        if gradient > self._rescue_limit():
-            return result, {
-                "scf_rescued_on_center_branch": False,
-                "scf_rescue_gradient_norm": gradient,
-            }
+        record = {
+            "scf_rescued_on_center_branch": gradient <= self._rescue_limit(),
+            "scf_rescue_gradient_norm": gradient,
+            "scf_rescue_lbfgs_gradient_norm": newton["lbfgs_gradient_norm"],
+            "scf_rescue_newton_cycles": newton["newton_cycles"],
+            "scf_rescue_newton_stop": newton["newton_stop"],
+        }
+        if not record["scf_rescued_on_center_branch"]:
+            return result, record
         seed = [
             True,
             float(energy_at(h1e, eri, occ)),
@@ -326,18 +355,13 @@ class ActiveHamiltonianSurface:
             h1e,
             eri,
         ]
-        info = {
-            "scf_rescued_on_center_branch": True,
-            "scf_rescue_gradient_norm": gradient,
-        }
-        updated = apply_orbital_rotation(
-            seed, kappa, float(energy_at(h1e, eri, occ, kappa)), info=info
-        )
+        updated = apply_orbital_rotation(seed, None, energy, info=record, rotation=u)
         updated[0] = True
-        return updated, info
+        return updated, record
 
     def _follow_negative_mode(self, result):
-        return follow_negative_mode(result, self.settings.follow_mode_tol)
+        return follow_negative_mode(result, self.settings.follow_mode_tol,
+                                    self.settings.scf_conv_tol_grad)
 
     def _embedding_record(self, solver) -> dict[str, Any]:
         singular = np.asarray(

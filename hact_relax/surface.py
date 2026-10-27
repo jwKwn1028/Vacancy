@@ -121,8 +121,10 @@ def follow_negative_mode(result, tol, newton_tol=1e-9):
     """Follow the lowest orbital-Hessian mode if it is below -``tol``, to a minimum
     finished by Newton steps to an orbital gradient of ``newton_tol``.
 
-    Returns the result, whether a mode was followed, and the record fields.  A
-    followed solution is canonical (``apply_orbital_rotation``).
+    The eigenvector's sign is arbitrary, and the two directions can end in different
+    minima, so both are followed and the lower minimum is kept (the + direction when
+    they agree to 1e-10 Ha).  Returns the result, whether a mode was followed, and the
+    record fields.  A followed solution is canonical (``apply_orbital_rotation``).
     """
     h1e = np.asarray(result[5]).real
     eri = np.asarray(result[6]).real
@@ -137,10 +139,13 @@ def follow_negative_mode(result, tol, newton_tol=1e-9):
         return result, False, info
 
     before = energy_at(h1e, eri, occ)
-    u, after, gradient, newton = minimize_and_finish(
-        h1e, eri, occ, 0.2 * np.asarray(report["lowest_mode"], dtype=float), newton_tol
-    )
+    mode = 0.2 * np.asarray(report["lowest_mode"], dtype=float)
+    ends = [minimize_and_finish(h1e, eri, occ, sign * mode, newton_tol) for sign in (1, -1)]
+    lower = int(ends[1][1] < ends[0][1] - 1e-10)
+    u, after, gradient, newton = ends[lower]
     info.update({
+        "negative_mode_direction": (1, -1)[lower],
+        "negative_mode_branch_gap_hartree": float(ends[1 - lower][1] - after),
         "negative_mode_energy_drop_hartree": float(after - before),
         "negative_mode_gradient_norm": gradient,
         "negative_mode_lbfgs_gradient_norm": newton["lbfgs_gradient_norm"],

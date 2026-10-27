@@ -660,6 +660,9 @@ class ActiveHamiltonianSurface:
         record["pristine_occupied_transport_fidelity"] = (
             None if occupied_match is None else float(occupied_match.fidelity)
         )
+        record["pristine_occupied_transport_spatial_fidelity"] = (
+            None if occupied_match is None else occupied_match.spatial_fidelity
+        )
         self._guard_pristine_overlap(
             None if occupied_match is None else occupied_match.fidelity,
             strict_continuation=strict_continuation,
@@ -714,6 +717,7 @@ class ActiveHamiltonianSurface:
         start_rotation = None
         start_occ = None
         record["active_transport_fidelity"] = None
+        record["active_transport_spatial_fidelity"] = None
         record["active_transport_fallback"] = False
         if self.active_solution_reference is not None:
             transport = transport_active_solution(
@@ -722,6 +726,8 @@ class ActiveHamiltonianSurface:
             start_rotation = transport.rotation
             start_occ = transport.occupations
             record["active_transport_fidelity"] = float(transport.fidelity)
+            record["active_transport_spatial_fidelity"] = (
+                transport.match.spatial_fidelity)
             transported_defect = transport_defect_orbital(
                 self.active_solution_reference, solver, start_rotation
             )

@@ -29,15 +29,25 @@ class ActiveSolutionReference:
 
 @dataclass
 class SubspaceMatch:
+    """The co-moving overlap of two orbital spaces (each AO carried with its atom), its
+    SVD, and the spatial overlap's singular values when the lattice is unchanged."""
     overlap: np.ndarray
     left: np.ndarray
     singular_values: np.ndarray
     right_h: np.ndarray
+    spatial_singular_values: np.ndarray | None = None
 
     @property
     def fidelity(self) -> float:
         return (float(self.singular_values.min())
                 if self.singular_values.size else 1.0)
+
+    @property
+    def spatial_fidelity(self) -> float | None:
+        if self.spatial_singular_values is None:
+            return None
+        return (float(self.spatial_singular_values.min())
+                if self.spatial_singular_values.size else 1.0)
 
 
 @dataclass
@@ -106,35 +116,42 @@ def match_orbital_subspaces(
         and not np.allclose(lattice0, lattice1, atol=1e-10, rtol=1e-10)
     )
 
+    layout0 = _ao_layout(reference_cell)
+    layout1 = _ao_layout(target_cell)
+    same_layout = layout0 is not None and layout0 == layout1
+    spatial = None
     if not lattice_changed:
         cross = np.asarray(pbc_cell.intor_cross(
             "int1e_ovlp", reference_cell, target_cell, kpt=np.zeros(3)
         ))
-        overlap = previous.conj().T @ cross @ current
-    else:
-        layout0 = _ao_layout(reference_cell)
-        layout1 = _ao_layout(target_cell)
-        if layout0 is None or layout1 is None or layout0 != layout1:
-            raise RuntimeError(
-                "a changed lattice requires identical atom/AO ordering for "
-                "co-moving orbital transport"
-            )
+        spatial = previous.conj().T @ cross @ current
+    elif not same_layout:
+        raise RuntimeError(
+            "a changed lattice requires identical atom/AO ordering for "
+            "co-moving orbital transport"
+        )
 
-        fractional0 = _fractional_coordinates(reference_cell, lattice0)
-        fractional1 = _fractional_coordinates(target_cell, lattice1)
-        if (fractional0 is None or fractional1 is None
-                or fractional0.shape != fractional1.shape):
-            raise RuntimeError(
-                "a changed lattice requires matching atomic fractional coordinates"
-            )
-        delta = fractional1 - fractional0
-        delta -= np.rint(delta)
-        drift = float(np.abs(delta).max()) if delta.size else 0.0
-        if drift > float(fractional_tolerance):
-            raise RuntimeError(
-                "cell continuation is not at fixed fractional coordinates: "
-                "maximum drift %.3e exceeds %.3e" % (drift, fractional_tolerance)
-            )
+    if not same_layout:
+        overlap = spatial
+    else:
+        if lattice_changed:
+            fractional0 = _fractional_coordinates(reference_cell, lattice0)
+            fractional1 = _fractional_coordinates(target_cell, lattice1)
+            if (fractional0 is None or fractional1 is None
+                    or fractional0.shape != fractional1.shape):
+                raise RuntimeError(
+                    "a changed lattice requires matching atomic fractional "
+                    "coordinates"
+                )
+            delta = fractional1 - fractional0
+            delta -= np.rint(delta)
+            drift = float(np.abs(delta).max()) if delta.size else 0.0
+            if drift > float(fractional_tolerance):
+                raise RuntimeError(
+                    "cell continuation is not at fixed fractional coordinates: "
+                    "maximum drift %.3e exceeds %.3e"
+                    % (drift, fractional_tolerance)
+                )
 
         if target_overlap is None:
             target_overlap = target_cell.pbc_intor("int1e_ovlp", hermi=1)
@@ -161,6 +178,9 @@ def match_orbital_subspaces(
         left=left,
         singular_values=np.asarray(singular, dtype=float),
         right_h=right_h,
+        spatial_singular_values=(
+            None if spatial is None
+            else np.linalg.svd(spatial, compute_uv=False).astype(float)),
     )
 
 

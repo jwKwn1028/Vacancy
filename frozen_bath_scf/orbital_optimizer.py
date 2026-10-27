@@ -69,7 +69,8 @@ def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8, cg_rtol=1e-3, cg_maxiter=3
     matrix.  Before the first step the lowest Hessian eigenvalue is found iteratively
     (so.lowest_hessian_modes): no step is taken unless it is positive, nor past negative
     curvature met by CG; a step is halved while it raises the energy.  Returns the
-    rotation, the rotated (h1e, eri) and a record.
+    rotation, the rotated (h1e, eri) and a record; a record that stops at a
+    non-positive lowest eigenvalue carries its mode as ``lowest_mode`` (an array).
     """
     mask = so.rotation_mask(mo_occ)
     u = np.eye(len(mo_occ))
@@ -82,11 +83,12 @@ def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8, cg_rtol=1e-3, cg_maxiter=3
             info["newton_stop"] = "max_cycle"
             break
         if info["newton_cycles"] == 0:
-            lowest, _, _, products = so.lowest_hessian_modes(h1e, eri, mo_occ)
+            lowest, modes, _, products = so.lowest_hessian_modes(h1e, eri, mo_occ)
             info["newton_lowest_hessian"] = float(lowest[0])
             info["newton_hessian_vector_products"] += products
             if lowest[0] <= 0.0:
                 info["newton_stop"] = "hessian_not_positive"
+                info["lowest_mode"] = modes[:, 0]
                 break
         diag = np.abs(so.hessian_diagonal_estimate(h1e, eri, mo_occ))
         precond = 1.0 / np.maximum(diag, 1e-3 * max(1.0, diag.max()))

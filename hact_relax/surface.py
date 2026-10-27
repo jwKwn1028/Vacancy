@@ -23,6 +23,7 @@ from frozen_bath_scf.schmidt_embedding import (
 )
 from system.pristine import build_pristine_mean_field
 from system.shells import nearest_atoms
+from system.fragment_fit import FragmentFit, KpointFit
 from system.split_fit import KpointOutside
 
 from hact_relax.cases import CASES
@@ -76,18 +77,37 @@ def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=Non
     return updated
 
 
-def minimize_and_finish(h1e, eri, occ, x0, newton_tol):
+def minimize_and_finish(h1e, eri, occ, x0, newton_tol, escapes=2):
     """L-BFGS at fixed occupations from ``x0``, then a Newton finish to an orbital
     gradient of ``newton_tol`` (orbital_optimizer.newton_finish).  Returns the rotation,
-    its energy, the final gradient norm and the Newton record."""
+    its energy, the final gradient norm and the Newton record.
+
+    L-BFGS can stop next to a saddle (a soft negative mode changes the energy below its
+    line search's resolution), where the Newton finish refuses to step.  Then the lowest
+    mode is followed down both ways and the lower minimum kept, at most ``escapes``
+    times (``saddle_escapes`` in the record)."""
     _, kappa = minimize_orbitals(h1e, eri, occ, x0)
     u = so._expm_antisym(kappa)
     h1e, eri = rotate_hamiltonian(h1e, eri, u)
     lbfgs = float(np.linalg.norm(so.orbital_gradient(h1e, eri, occ)))
-    v, h1e, eri, newton = newton_finish(h1e, eri, occ, newton_tol)
+    v, h1e_n, eri_n, newton = newton_finish(h1e, eri, occ, newton_tol)
+    mode = newton.pop("lowest_mode", None)
     newton["lbfgs_gradient_norm"] = lbfgs
-    return (u @ v, float(energy_at(h1e, eri, occ)), newton["newton_gradient_after"],
-            newton)
+    newton["saddle_escapes"] = 0
+    if mode is None or escapes <= 0:
+        return (u @ v, float(energy_at(h1e_n, eri_n, occ)),
+                newton["newton_gradient_after"], newton)
+    step = 0.2 * np.asarray(mode, dtype=float)
+    ends = [minimize_and_finish(h1e, eri, occ, sign * step, newton_tol, escapes - 1)
+            for sign in (1, -1)]
+    lower = int(ends[1][1] < ends[0][1] - 1e-10)
+    w, energy, gradient, record = ends[lower]
+    record = dict(record)
+    record["lbfgs_gradient_norm"] = lbfgs
+    record["saddle_escapes"] += 1
+    record["saddle_lowest_hessian"] = newton["newton_lowest_hessian"]
+    record["saddle_branch_gap_hartree"] = float(ends[1 - lower][1] - energy)
+    return u @ w, energy, gradient, record
 
 
 def rescue_unconverged(result, gradient_limit, newton_tol=None):
@@ -110,7 +130,8 @@ def rescue_unconverged(result, gradient_limit, newton_tol=None):
             "scf_rescue_gradient_norm": gradient,
             "scf_rescue_lbfgs_gradient_norm": newton["lbfgs_gradient_norm"],
             "scf_rescue_newton_cycles": newton["newton_cycles"],
-            "scf_rescue_newton_stop": newton["newton_stop"]}
+            "scf_rescue_newton_stop": newton["newton_stop"],
+            "scf_rescue_saddle_escapes": newton["saddle_escapes"]}
     if not info["scf_rescued"]:
         return result, info
     updated = apply_orbital_rotation(result, None, energy, info=info, rotation=u)
@@ -152,6 +173,7 @@ def follow_negative_mode(result, tol, newton_tol=1e-9):
         "negative_mode_lbfgs_gradient_norm": newton["lbfgs_gradient_norm"],
         "negative_mode_newton_cycles": newton["newton_cycles"],
         "negative_mode_newton_stop": newton["newton_stop"],
+        "negative_mode_saddle_escapes": newton["saddle_escapes"],
     })
     if not (after < before - abs(tol)):
         return result, False, info
@@ -201,6 +223,12 @@ class SurfaceSettings:
     split_kmesh: tuple[int, int, int] | None = None
     split_primitive_atoms: list | None = None
     split_primitive_lattice_bohr: np.ndarray | None = None
+    # "fragment": the fragment fit, the exact Gamma fit built from the k-point one
+    # (system/fragment_fit.py); "gamma": the split fit (Gamma inside the fragment).
+    split_fit: str = "fragment"
+    # Thresholds of the ideal crystal's k-point SCF; None takes scf_conv_tol(_grad).
+    split_kpoint_conv_tol: float | None = None
+    split_kpoint_conv_tol_grad: float | None = None
 
 
 class ActiveHamiltonianSurface:
@@ -240,6 +268,9 @@ class ActiveHamiltonianSurface:
         self.split_outside: KpointOutside | None = None
         self.split_ideal_coords: np.ndarray | None = None
         self.split_atoms: tuple[int, ...] | None = None
+        if settings.split_fit not in ("gamma", "fragment"):
+            raise ValueError("split_fit must be 'gamma' or 'fragment', got %r"
+                             % (settings.split_fit,))
         if settings.split_kmesh is not None:
             symbols, self.split_ideal_coords = ideal_supercell(
                 settings.split_primitive_atoms, settings.split_primitive_lattice_bohr,
@@ -297,6 +328,8 @@ class ActiveHamiltonianSurface:
             )
         if self.split_outside is None:
             settings = self.settings
+            fragment_fit = settings.split_fit == "fragment"
+            records = [] if fragment_fit else None
             with self.recorder.stage(
                 "split_kpoint_scf", evaluation=evaluation, reason=reason
             ):
@@ -308,15 +341,24 @@ class ActiveHamiltonianSurface:
                     exxdiv=None,
                     verbose=settings.verbose,
                     max_memory=settings.memory_mb,
-                    conv_tol=settings.scf_conv_tol,
-                    conv_tol_grad=settings.scf_conv_tol_grad,
+                    conv_tol=(settings.scf_conv_tol
+                              if settings.split_kpoint_conv_tol is None
+                              else settings.split_kpoint_conv_tol),
+                    conv_tol_grad=(settings.scf_conv_tol_grad
+                                   if settings.split_kpoint_conv_tol_grad is None
+                                   else settings.split_kpoint_conv_tol_grad),
                     max_cycle=settings.scf_max_cycle,
                     auxbasis=settings.auxbasis,
+                    fit_records=records,
                 )
-                self.split_outside = KpointOutside(kmf, settings.split_kmesh)
+                self.split_outside = (
+                    KpointFit(kmf, settings.split_kmesh, records) if fragment_fit
+                    else KpointOutside(kmf, settings.split_kmesh)
+                )
                 del kmf
                 gc.collect()
         record.update({
+            "split_fit": self.settings.split_fit,
             "pristine_reference": "split",
             "split_kmesh": list(self.settings.split_kmesh),
             "split_fragment_atoms": list(self.split_atoms),
@@ -349,6 +391,7 @@ class ActiveHamiltonianSurface:
             "scf_rescue_lbfgs_gradient_norm": newton["lbfgs_gradient_norm"],
             "scf_rescue_newton_cycles": newton["newton_cycles"],
             "scf_rescue_newton_stop": newton["newton_stop"],
+            "scf_rescue_saddle_escapes": newton["saddle_escapes"],
         }
         if not record["scf_rescued_on_center_branch"]:
             return result, record
@@ -595,6 +638,14 @@ class ActiveHamiltonianSurface:
             "pristine_scf_final_orbital_gradient_norm": pristine_scf["gradient"],
             "pristine_guess_from_previous_center": prior_pristine is not None,
         })
+        fit = pristine_kmf.with_df
+        if isinstance(fit, FragmentFit):
+            record.update({
+                "fragment_fit_moved_atoms": [int(a) for a in fit.moved],
+                "fragment_fit_timings": {k: float(v) for k, v in fit.timings.items()},
+                "fragment_fit_seam_max": fit.seam_max,
+                "fragment_fit_aux_residual_min": fit.aux_residual_min,
+            })
         if pristine_scf["delta"] is not None:
             noise = abs(float(pristine_scf["delta"])) * ncells
             self.measured_noise_floor = max(

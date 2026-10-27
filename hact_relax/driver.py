@@ -390,9 +390,14 @@ def run_one(
     if getattr(args, "split", False):
         split_atoms, split_lattice, split_kmesh = _primitive_crystal(args, case)
         geometry_fields["split_kmesh"] = list(split_kmesh)
+        geometry_fields["split_fit"] = str(getattr(args, "split_fit", None) or "fragment")
         geometry_fields["periodic_scf"] = (
             "Gamma KRHF of the supercell; ERIs with all four AOs outside the "
             "fragment from the ideal crystal's k-point GDF (--split)"
+            if geometry_fields["split_fit"] == "gamma" else
+            "Gamma KRHF of the supercell with the fragment fit: the exact Gamma fit "
+            "built from the ideal crystal's k-point fit and the moved atoms' "
+            "integrals, k-point nuclear attraction (--split --split-fit fragment)"
         )
     if not movable:
         raise ValueError("no real atoms selected for relaxation")
@@ -447,6 +452,7 @@ def run_one(
         split_kmesh=split_kmesh,
         split_primitive_atoms=split_atoms,
         split_primitive_lattice_bohr=split_lattice,
+        split_fit=str(getattr(args, "split_fit", None) or "fragment"),
     )
     driver_mol = build_driver_molecule(
         labels, coords_bohr, case, args.basis, args.memory_mb, args.verbose

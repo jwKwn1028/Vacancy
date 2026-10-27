@@ -80,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", action="store_true",
                         help="Gamma reference whose ERIs outside the fragment "
                              "come from the ideal crystal's k-point GDF")
+    parser.add_argument("--split-fit", choices=("fragment", "gamma"), default=None,
+                        help="with --split: 'fragment' (default) builds the exact Gamma "
+                             "fit from the k-point one and the moved atoms' integrals "
+                             "(system/fragment_fit.py), with the k-point nuclear "
+                             "attraction; 'gamma' fits the fragment's ERIs with a Gamma "
+                             "GDF of the supercell")
     parser.add_argument("--coordsys", default="cart",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
 
@@ -205,6 +211,10 @@ def validate_args(parser: argparse.ArgumentParser, args):
         )
     if args.split and args.reference != "gamma":
         parser.error("--split is a Gamma reference; drop --reference kmesh")
+    if args.split_fit is not None and not args.split:
+        parser.error("--split-fit chooses the fit of --split; add --split")
+    if args.split and args.split_fit is None:
+        args.split_fit = "fragment"
     if args.memory_mb < 1 or args.fd_step <= 0 or args.maxsteps < 1:
         parser.error("--memory-mb, --fd-step and --maxsteps must be positive")
     if args.max_gradient <= 0.0 or args.bath_tol <= 0.0:

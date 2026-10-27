@@ -53,7 +53,13 @@ def build_pristine_mean_field(
     callback=None,
     chkfile=None,
     split=None,
+    fit_records=None,
 ):
+    """The pristine KRHF.  ``split`` = (outside, atoms) replaces the Gamma GDF: a
+    split_fit.KpointOutside gives the split fit (k-point ERIs outside the fragment ``atoms``,
+    Gamma inside), a fragment_fit.KpointFit the fragment fit (the exact Gamma fit from the
+    k-point one).  A list ``fit_records`` collects the GDF builder and its metric factors,
+    which a fragment_fit.KpointFit of this mean field needs."""
     from pyscf.pbc import gto, scf
 
     cell = gto.Cell()
@@ -71,12 +77,16 @@ def build_pristine_mean_field(
     kpts = cell.make_kpts(list(kmesh))
     kmf = scf.KRHF(cell, kpts, exxdiv=exxdiv).density_fit(auxbasis=auxbasis)
     if split is not None:
+        from system.fragment_fit import FragmentFit, KpointFit
         from system.split_fit import SplitDensityFit, fragment_aos
 
         if len(kpts) != 1:
             raise ValueError("split integrals need the Gamma supercell")
         outside, atoms = split
-        kmf.with_df = SplitDensityFit(kmf.with_df, outside, fragment_aos(cell, atoms))
+        if isinstance(outside, KpointFit):
+            kmf.with_df = FragmentFit(outside, cell, atoms)
+        else:
+            kmf.with_df = SplitDensityFit(kmf.with_df, outside, fragment_aos(cell, atoms))
     kmf.conv_tol = float(conv_tol)
     kmf.conv_tol_grad = float(conv_tol_grad)
     kmf.max_cycle = int(max_cycle)
@@ -96,7 +106,15 @@ def build_pristine_mean_field(
     _install_pristine_hcore_capture(kmf)
     if callback is not None:
         kmf.callback = callback
-    kmf.kernel(dm0=dm0)
+    if fit_records is None:
+        kmf.kernel(dm0=dm0)
+    else:
+        from pyscf import lib
+        from pyscf.pbc.df import df as pbc_df
+        from system.fragment_fit import recording_builder
+
+        with lib.temporary_env(pbc_df, _RSGDFBuilder=recording_builder(fit_records)):
+            kmf.kernel(dm0=dm0)
     if not kmf.converged:
         raise RuntimeError("pristine KRHF did not converge")
     if chkfile is not None:

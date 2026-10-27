@@ -59,6 +59,30 @@ def _write_embedding(group, solver, checkpoint_eri) -> None:
     group["core_energy_computed"] = 1
 
 
+def _write_eri(group, eri) -> None:
+    """The active ERIs: density-fitting factors (eri_active_df, eri_active_df_sign), or
+    a dense eri_active."""
+    from frozen_bath_scf.df_eri import DFEri, as_eri
+
+    eri = as_eri(eri)
+    if isinstance(eri, DFEri):
+        group["eri_active_df"] = eri.factors
+        group["eri_active_df_sign"] = eri.sign
+    else:
+        group["eri_active"] = eri
+
+
+def eri_from_data(data):
+    """The active ERIs of a loaded group (either form), or None."""
+    from frozen_bath_scf.df_eri import DFEri
+
+    if data.get("eri_active_df") is not None:
+        return DFEri(data["eri_active_df"], data.get("eri_active_df_sign"))
+    if data.get("eri_active") is not None:
+        return np.asarray(data["eri_active"], dtype=float)
+    return None
+
+
 def write_hact_checkpoint(path, *, meta, solver, result, energy, checkpoint_eri,
                           extra=None) -> None:
     """Write group ``hact``: a converged frozen-bath SCF.  Replaces the file."""
@@ -73,7 +97,7 @@ def write_hact_checkpoint(path, *, meta, solver, result, energy, checkpoint_eri,
         group["mo_energy_active"] = np.asarray(result[2]).real
         group["h1e_active"] = np.asarray(result[5]).real
         if checkpoint_eri and result[6] is not None:
-            group["eri_active"] = np.asarray(result[6]).real
+            _write_eri(group, result[6])
         _write_embedding(group, solver, checkpoint_eri)
         _write_meta(group, extra or {})
 
@@ -101,7 +125,7 @@ def write_hact_input_checkpoint(path, *, meta, solver, checkpoint_eri, scf,
             group[name] = value
         group["heff"] = np.asarray(solver.heff).real
         if checkpoint_eri:
-            group["eri_active"] = np.asarray(solver.eri_active).real
+            _write_eri(group, solver.eri_active)
         group["mo_occ_seed"] = np.asarray(seed).real
         _write_embedding(group, solver, checkpoint_eri)
         c_def = getattr(solver, "_c_def", None)
@@ -135,8 +159,8 @@ def load_hact_input(path) -> dict[str, Any]:
             raise RuntimeError("%s has no %s group" % (path, INPUT_GROUP))
         group = handle[INPUT_GROUP]
         data = {name: _decode(group[name][()]) for name in group}
-    for name in ("eri_active", "c_def", "start_rotation", "start_occ",
-                 "bath_singular_values"):
+    for name in ("eri_active", "eri_active_df", "eri_active_df_sign", "c_def",
+                 "start_rotation", "start_occ", "bath_singular_values"):
         data.setdefault(name, None)
     return data
 
@@ -158,7 +182,7 @@ def solver_from_hact_input(data: dict[str, Any], memory_mb: int = 4000):
     )
     from hact_relax.geometry import ghost_species
 
-    if data["eri_active"] is None:
+    if eri_from_data(data) is None:
         raise RuntimeError(
             "the input checkpoint has no active ERIs (the run used "
             "--no-eri-checkpoint), so its SCF cannot be re-solved"
@@ -198,7 +222,7 @@ def solver_from_hact_input(data: dict[str, Any], memory_mb: int = 4000):
         solver.mo_occ = seed
         solver.nelecas = nelecas[0]
     solver.heff = np.asarray(data["heff"], dtype=float)
-    solver.eri_active = np.asarray(data["eri_active"], dtype=float)
+    solver.eri_active = eri_from_data(data)
     solver.E1e_core = float(data["e1e_core"])
     solver.E2e_core = float(data["e2e_core"])
     solver.Enuc = float(data["enuc"])

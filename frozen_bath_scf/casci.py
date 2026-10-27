@@ -11,6 +11,22 @@ import numpy as np
 
 from pyscf import gto, scf, ao2mo, mcscf, fci
 
+from .df_eri import dense_eri, eri_j, eri_k, take_eri
+
+
+def cas_hamiltonian(h1e, eri, ncore, ncas):
+    """The CAS window's Hamiltonian with the first ``ncore`` (doubly occupied) orbitals
+    folded in as PySCF's CASCI does: h + J[D_c] - K[D_c]/2 on the window, the core's
+    electronic energy Tr[D_c (h + v_c/2)], and the window's dense ERIs (ncas^4).  The
+    full active space's ERIs (dense or DFEri) are never made dense."""
+    n = h1e.shape[0]
+    dc = np.diag(np.r_[np.full(ncore, 2.0), np.zeros(n - ncore)])
+    veff = eri_j(eri, dc) - 0.5 * eri_k(eri, dc) if ncore else np.zeros_like(h1e)
+    e_core = float(np.einsum("ij,ji->", dc, h1e + 0.5 * veff))
+    window = np.arange(ncore, ncore + ncas)
+    h_cas = (h1e + veff)[np.ix_(window, window)]
+    return h_cas, dense_eri(take_eri(eri, window)), e_core
+
 
 def _fake_mf(h1e, eri, ecore, n_active_elec):
     """Wrap an MO-basis active Hamiltonian (h1e, eri, ecore) in a mean field

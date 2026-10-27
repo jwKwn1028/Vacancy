@@ -8,7 +8,8 @@ from scipy.optimize import linear_sum_assignment
 
 from pyscf.pbc.gto import cell as pbc_cell
 
-from frozen_bath_scf.casci import _fake_mf, _run_casci
+from frozen_bath_scf.casci import _fake_mf, _run_casci, cas_hamiltonian
+from frozen_bath_scf.df_eri import as_eri, take_eri
 
 
 @dataclass
@@ -644,7 +645,7 @@ def casci_energy(
 ) -> CASCIResult:
     """CASCI on ``H_act^V`` with a vacancy-local CAS and root tracking."""
     h1e = np.asarray(result[5]).real
-    eri = np.asarray(result[6]).real
+    eri = as_eri(result[6])
     orbital_energy = np.asarray(result[2]).real
     active_coeff = None if result[3] is None else np.asarray(result[3]).real
     active_occ = np.asarray(result[4]).real
@@ -737,21 +738,16 @@ def casci_energy(
         cas_window_min_overlap = float(np.min(window)) if window.size else 1.0
         orbital_subspace_singular_values = match.singular_values.copy()
 
-    h1e = h1e[np.ix_(order, order)]
-    eri = eri[np.ix_(order, order, order, order)]
-    h1e = h1e * (signs[:, None] * signs[None, :])
-    eri = eri * (
-        signs[:, None, None, None]
-        * signs[None, :, None, None]
-        * signs[None, None, :, None]
-        * signs[None, None, None, :]
-    )
+    h1e = h1e[np.ix_(order, order)] * (signs[:, None] * signs[None, :])
+    eri = take_eri(eri, order, signs)
     ordered_active_coeff = (
         None if active_coeff is None else active_coeff[:, order] * signs[None, :]
     )
 
-    ecore = float(solver.E1e_core + solver.E2e_core + solver.Enuc)
-    fake_mf = _fake_mf(h1e, eri, ecore, active_electrons)
+    # The CASCI runs on the window alone, with the doubly occupied core folded in.
+    h1e_cas, eri_cas, e_core_window = cas_hamiltonian(h1e, eri, ncore, ncas)
+    ecore = float(solver.E1e_core + solver.E2e_core + solver.Enuc) + e_core_window
+    fake_mf = _fake_mf(h1e_cas, eri_cas, ecore, ncas_elec)
     max_memory = getattr(solver, "max_memory", None)
     if max_memory is not None:
         fake_mf.max_memory = int(max_memory)
@@ -762,7 +758,7 @@ def casci_energy(
         ncas_elec,
         two_s=two_s,
         nroots=max(nroots, root + 1),
-        ncore=ncore,
+        ncore=0,
     )
     states = sorted(states, key=lambda state: state[0])
     if root >= len(states):

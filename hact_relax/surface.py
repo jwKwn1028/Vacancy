@@ -9,6 +9,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from frozen_bath_scf import second_order as so
+from frozen_bath_scf.df_eri import as_eri
 from frozen_bath_scf.orbital_optimizer import (
     canonical_block_rotation,
     energy_at,
@@ -51,7 +52,7 @@ def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=Non
     """``result`` with its active orbitals rotated by exp(kappa), or by ``rotation``.
     """
     h1e = np.asarray(result[5]).real
-    eri = np.asarray(result[6]).real
+    eri = as_eri(result[6])
     occ = np.asarray(result[4]).real
     u = so._expm_antisym(kappa) if rotation is None else np.asarray(rotation)
     dm_a, dm_b = so.densities(occ)
@@ -99,7 +100,7 @@ def rescue_unconverged(result, gradient_limit, newton_tol=None):
     if result[5] is None or result[6] is None:
         return result, {"scf_rescued": False}
     h1e = np.asarray(result[5]).real
-    eri = np.asarray(result[6]).real
+    eri = as_eri(result[6])
     occ = np.asarray(result[4]).real
     u, energy, gradient, newton = minimize_and_finish(
         h1e, eri, occ, np.zeros(int(so.rotation_mask(occ).sum())),
@@ -127,7 +128,7 @@ def follow_negative_mode(result, tol, newton_tol=1e-9):
     record fields.  A followed solution is canonical (``apply_orbital_rotation``).
     """
     h1e = np.asarray(result[5]).real
-    eri = np.asarray(result[6]).real
+    eri = as_eri(result[6])
     occ = np.asarray(result[4]).real
     report = so.stability_analysis(h1e, eri, occ)
     info = {
@@ -337,7 +338,7 @@ class ActiveHamiltonianSurface:
         occ = np.asarray(start_occ, dtype=float).copy()
         h1e = np.asarray(solver.get_hcore(solver.heff, u0)).real
         _, eri = solver.get_veff(occ, solver.eri_active, u0)
-        eri = np.asarray(eri).real
+        eri = as_eri(eri)
         u, energy, gradient, newton = minimize_and_finish(
             h1e, eri, occ, np.zeros(int(so.rotation_mask(occ).sum())),
             self.settings.scf_conv_tol_grad,

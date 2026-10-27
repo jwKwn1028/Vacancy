@@ -2,6 +2,8 @@ import numpy as np
 
 from pyscf import lib
 
+from .df_eri import eri_j, eri_k, rotate_eri
+
 
 class FrozenActiveSpace:
 
@@ -41,9 +43,9 @@ class FrozenActiveSpace:
             )
 
         occ_active = self.mo_occ[self.active_orb]
+        dm = np.diag(occ_active)
         vhf_mo_mo_active = (
-            lib.einsum("ijkk, k -> ij", self.eri_active, occ_active)
-            - 0.5 * lib.einsum("ikkj, k -> ij", self.eri_active, occ_active)
+            eri_j(self.eri_active, dm) - 0.5 * eri_k(self.eri_active, dm)
         )
         vhf_mo_mo_int = vhf_active_P - vhf_mo_mo_active
 
@@ -69,10 +71,7 @@ class FrozenActiveSpace:
 
     @staticmethod
     def _rotate_eri(eri, U):
-        eri = lib.einsum("ir, rspq -> ispq", U.T, eri)
-        eri = lib.einsum("js, ispq -> ijpq", U.T, eri)
-        eri = lib.einsum("ijpq, pk -> ijkq", eri, U)
-        return lib.einsum("ijkq, ql -> ijkl", eri, U)
+        return rotate_eri(eri, U)
 
     def _start_frame(self, mo_coeff_active, start_rotation, start_occ):
         U0 = np.asarray(start_rotation, dtype=float)

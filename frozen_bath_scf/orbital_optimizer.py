@@ -1,10 +1,10 @@
 import numpy as np
-from scipy.linalg import expm_frechet
 from scipy.optimize import minimize
 
-from pyscf import lib
-
 from . import second_order as so
+from .df_eri import rotate_eri
+
+energy_and_gradient = so.energy_and_gradient
 
 
 def energy_at(h1e, eri, mo_occ, kappa=None):
@@ -13,22 +13,6 @@ def energy_at(h1e, eri, mo_occ, kappa=None):
         u = so._expm_antisym(kappa)
         dm_a, dm_b = u @ dm_a @ u.T, u @ dm_b @ u.T
     return so.energy_from_dm(h1e, dm_a, dm_b, eri)
-
-
-def energy_and_gradient(h1e, eri, mo_occ, kappa):
-    """E(exp(kappa)) and its exact derivative with respect to the antisymmetric kappa.
-
-    dE/dU = 2 (F^a U d^a + F^b U d^b) is carried back through the adjoint of the
-    exponential's Frechet derivative, L(kappa^T, .).
-    """
-    u = so._expm_antisym(kappa)
-    dm_a, dm_b = so.densities(mo_occ)
-    da, db = u @ dm_a @ u.T, u @ dm_b @ u.T
-    v_a, v_b = so.general_veff(eri, da, db)
-    energy = float(np.einsum("ij,ji->", h1e, da + db)
-                   + 0.5 * (np.einsum("ij,ji->", v_a, da) + np.einsum("ij,ji->", v_b, db)))
-    du = 2 * ((h1e + v_a) @ u @ dm_a + (h1e + v_b) @ u @ dm_b)
-    return energy, expm_frechet(kappa.T, du, compute_expm=False)
 
 
 def minimize_orbitals(h1e, eri, mo_occ, x0, maxiter=2000, gtol=1e-9):
@@ -46,40 +30,73 @@ def minimize_orbitals(h1e, eri, mo_occ, x0, maxiter=2000, gtol=1e-9):
 
 
 def rotate_hamiltonian(h1e, eri, u):
-    h = u.T @ h1e @ u
-    g = lib.einsum("pqrs,pi->iqrs", eri, u)
-    g = lib.einsum("iqrs,qj->ijrs", g, u)
-    g = lib.einsum("ijrs,rk->ijks", g, u)
-    g = lib.einsum("ijks,sl->ijkl", g, u)
-    return h, g
+    return u.T @ h1e @ u, rotate_eri(eri, u)
 
 
-def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8):
+def _conjugate_gradient(hvp, b, precond, rtol, maxiter):
+    """Preconditioned CG for H x = b.  Stops at negative curvature (returns the iterate
+    so far and False).  Returns (x, positive, products)."""
+    x = np.zeros_like(b)
+    r = b.copy()
+    z = precond * r
+    p = z.copy()
+    rz = float(r @ z)
+    target = rtol * float(np.linalg.norm(b))
+    for it in range(maxiter):
+        hp = hvp(p)
+        curvature = float(p @ hp)
+        if curvature <= 0.0:
+            return x, False, it + 1
+        alpha = rz / curvature
+        x = x + alpha * p
+        r = r - alpha * hp
+        if np.linalg.norm(r) <= target:
+            return x, True, it + 1
+        z = precond * r
+        rz_new = float(r @ z)
+        p = z + (rz_new / rz) * p
+        rz = rz_new
+    return x, True, maxiter
+
+
+def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8, cg_rtol=1e-3, cg_maxiter=300):
     """Newton steps at fixed occupations until the orbital gradient norm is at most ``tol``.
 
     Each step is taken in the current orbitals.  It finishes what minimize_orbitals
     cannot: near a minimum its energy-based line search stops where the energy change,
-    about |g|^2 / H, reaches rounding.  A step is taken only where the Hessian is positive
-    definite, and is halved while it raises the energy.  Returns the rotation, the
-    rotated (h1e, eri) and a record.
+    about |g|^2 / H, reaches rounding.  The Newton equations are solved by preconditioned
+    conjugate gradients on Hessian-vector products (so.hessian_vector), with no Hessian
+    matrix.  Before the first step the lowest Hessian eigenvalue is found iteratively
+    (so.lowest_hessian_modes): no step is taken unless it is positive, nor past negative
+    curvature met by CG; a step is halved while it raises the energy.  Returns the
+    rotation, the rotated (h1e, eri) and a record.
     """
     mask = so.rotation_mask(mo_occ)
     u = np.eye(len(mo_occ))
     g = so.orbital_gradient(h1e, eri, mo_occ)
     e = energy_at(h1e, eri, mo_occ)
     info = {"newton_cycles": 0, "newton_gradient_before": float(np.linalg.norm(g)),
-            "newton_stop": "converged"}
+            "newton_stop": "converged", "newton_hessian_vector_products": 0}
     while np.linalg.norm(g) > tol:
         if info["newton_cycles"] == max_cycle:
             info["newton_stop"] = "max_cycle"
             break
-        hess = so.orbital_hessian(h1e, eri, mo_occ)
-        lowest = float(np.linalg.eigvalsh(hess)[0])
-        if lowest <= 0.0:
+        if info["newton_cycles"] == 0:
+            lowest, _, _, products = so.lowest_hessian_modes(h1e, eri, mo_occ)
+            info["newton_lowest_hessian"] = float(lowest[0])
+            info["newton_hessian_vector_products"] += products
+            if lowest[0] <= 0.0:
+                info["newton_stop"] = "hessian_not_positive"
+                break
+        diag = np.abs(so.hessian_diagonal_estimate(h1e, eri, mo_occ))
+        precond = 1.0 / np.maximum(diag, 1e-3 * max(1.0, diag.max()))
+        x, positive, products = _conjugate_gradient(
+            lambda v: so.hessian_vector(h1e, eri, mo_occ, v, mask=mask), -g, precond,
+            cg_rtol, cg_maxiter)
+        info["newton_hessian_vector_products"] += products
+        if not positive:
             info["newton_stop"] = "hessian_not_positive"
-            info["newton_lowest_hessian"] = lowest
             break
-        x = -np.linalg.solve(hess, g)
         for _ in range(6):
             step = so._expm_antisym(so._kappa_from_vector(x, mask))
             h_new, eri_new = rotate_hamiltonian(h1e, eri, step)

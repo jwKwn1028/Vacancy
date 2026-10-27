@@ -11,6 +11,7 @@ from pyscf.scf import rohf
 from system.iao_pao import iao_pao_supercell
 from system.shells import minimum_image_offsets, nearest_atoms
 
+from .df_eri import DFEri
 from .frozen_rhf import Frozen_RHF
 from .frozen_rohf import Frozen_ROHF
 
@@ -450,7 +451,11 @@ class _SchmidtEmbedding:
             Lpq = (LpqR + 1j * LpqI).reshape(-1, nao, nao)
             Lij_chunks.append(lib.einsum("Lpq,pi,qj->Lij", Lpq, Cact, Cact))
         Lij = np.concatenate(Lij_chunks, axis=0)
-        self.eri_active = lib.einsum("Lij,Lkl->ijkl", Lij, Lij).real
+        # Re(sum_P L L) for complex L = A + iB: factors [A; B] with signs [+1; -1].
+        self.eri_active = DFEri(
+            np.concatenate([Lij.real, Lij.imag]),
+            np.r_[np.ones(len(Lij)), -np.ones(len(Lij))],
+        )
 
     def _defect_frame_coords(self):
         coords = self.scell.atom_coords()
@@ -502,8 +507,7 @@ class _SchmidtEmbedding:
         for Lpq in dfobj.loop():
             Lpq = lib.unpack_tril(np.asarray(Lpq)).reshape(-1, nao, nao)
             Lij_chunks.append(lib.einsum("Lpq,pi,qj->Lij", Lpq, Cact, Cact))
-        Lij = np.concatenate(Lij_chunks, axis=0)
-        return lib.einsum("Lij,Lkl->ijkl", Lij, Lij).real
+        return DFEri(np.concatenate(Lij_chunks, axis=0).real)
 
     def _nuc_ao_integral_for_atom(self, symmetric=True):
         nao = self.scell.nao_nr()

@@ -3,6 +3,7 @@ import numpy as np
 from pyscf import lib
 from pyscf.scf import hf
 
+from .df_eri import eri_j, eri_k
 from .frozen_active_space import FrozenActiveSpace
 
 
@@ -86,9 +87,8 @@ class Frozen_RHF(FrozenActiveSpace, hf.SCF):
 
     def get_veff(self, mo_occ, eri=None, U=None):
         eri_active = self.eri_active if eri is None else self._rotate_eri(eri, U)
-        vj = lib.einsum("ijkk, k -> ij", eri_active, mo_occ)
-        vk = lib.einsum("ikkj, k -> ij", eri_active, mo_occ)
-        return vj - 0.5 * vk, eri_active
+        dm = np.diag(np.asarray(mo_occ, dtype=float))
+        return eri_j(eri_active, dm) - 0.5 * eri_k(eri_active, dm), eri_active
 
     def energy_elec(self, h1e, vhf, mo_occ):
         e_1e = np.sum(np.diagonal(h1e) * mo_occ)

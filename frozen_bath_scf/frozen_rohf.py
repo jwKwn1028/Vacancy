@@ -3,6 +3,7 @@ import numpy as np
 from pyscf import lib
 from pyscf.scf import hf, rohf
 
+from .df_eri import eri_j, eri_k
 from .frozen_active_space import FrozenActiveSpace
 
 
@@ -105,20 +106,10 @@ class Frozen_ROHF(FrozenActiveSpace, rohf.ROHF):
     def get_veff(self, mo_occ, eri=None, U=None):
         eri_active = self.eri_active if eri is None else self._rotate_eri(eri, U)
 
-        mo_occ_a = (mo_occ > 0).astype(np.double)
-        mo_occ_b = (mo_occ == 2).astype(np.double)
-
-        vhf_a = (
-            lib.einsum("ijkk, k -> ij", eri_active, mo_occ_a)
-            + lib.einsum("ijkk, k -> ij", eri_active, mo_occ_b)
-            - lib.einsum("ikkj, k -> ij", eri_active, mo_occ_a)
-        )
-        vhf_b = (
-            lib.einsum("ijkk, k -> ij", eri_active, mo_occ_b)
-            + lib.einsum("ijkk, k -> ij", eri_active, mo_occ_a)
-            - lib.einsum("ikkj, k -> ij", eri_active, mo_occ_b)
-        )
-        return [vhf_a, vhf_b], eri_active
+        dm_a = np.diag((mo_occ > 0).astype(np.double))
+        dm_b = np.diag((mo_occ == 2).astype(np.double))
+        vj = eri_j(eri_active, dm_a + dm_b)
+        return [vj - eri_k(eri_active, dm_a), vj - eri_k(eri_active, dm_b)], eri_active
 
     def energy_elec(self, h1e, vhf, mo_occ):
         mo_occa = (mo_occ > 0).astype(np.double)

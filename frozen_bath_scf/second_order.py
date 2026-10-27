@@ -1,14 +1,12 @@
 import numpy as np
-from scipy.linalg import expm
+from scipy.linalg import expm, expm_frechet
 
-from pyscf import lib
+from .df_eri import eri_j, eri_k
 
 
 def general_veff(eri, dm_a, dm_b):
-    j = lib.einsum("ijkl,lk->ij", eri, dm_a + dm_b)
-    k_a = lib.einsum("ikjl,lk->ij", eri, dm_a)
-    k_b = lib.einsum("ikjl,lk->ij", eri, dm_b)
-    return [j - k_a, j - k_b]
+    j = eri_j(eri, dm_a + dm_b)
+    return [j - eri_k(eri, dm_a), j - eri_k(eri, dm_b)]
 
 
 def energy_from_dm(h1e, dm_a, dm_b, eri):
@@ -68,6 +66,105 @@ def orbital_gradient(h1e, eri, mo_occ, kappa=None):
     return g[mask]
 
 
+def energy_and_gradient(h1e, eri, mo_occ, kappa):
+    """E(exp(kappa)) and its exact derivative with respect to the antisymmetric kappa.
+
+    dE/dU = 2 (F^a U d^a + F^b U d^b) is carried back through the adjoint of the
+    exponential's Frechet derivative, L(kappa^T, .).
+    """
+    u = _expm_antisym(kappa)
+    dm_a, dm_b = densities(mo_occ)
+    da, db = u @ dm_a @ u.T, u @ dm_b @ u.T
+    v_a, v_b = general_veff(eri, da, db)
+    energy = float(np.einsum("ij,ji->", h1e, da + db)
+                   + 0.5 * (np.einsum("ij,ji->", v_a, da) + np.einsum("ij,ji->", v_b, db)))
+    du = 2 * ((h1e + v_a) @ u @ dm_a + (h1e + v_b) @ u @ dm_b)
+    return energy, expm_frechet(kappa.T, du, compute_expm=False)
+
+
+def _exact_gradient_vector(h1e, eri, mo_occ, x, mask):
+    _, g = energy_and_gradient(h1e, eri, mo_occ, _kappa_from_vector(x, mask))
+    return g[mask] - g.T[mask]
+
+
+def hessian_vector(h1e, eri, mo_occ, v, step=1e-4, mask=None):
+    """The orbital Hessian times ``v``, on the scale of orbital_gradient (half the exact
+    Hessian of E(exp(kappa)) at kappa = 0, as orbital_hessian), by a central difference
+    of the exact gradient along v: two gradient evaluations."""
+    mask = rotation_mask(mo_occ) if mask is None else mask
+    v = np.asarray(v, dtype=float)
+    norm = float(np.linalg.norm(v))
+    if norm == 0.0:
+        return np.zeros_like(v)
+    x = (step / norm) * v
+    plus = _exact_gradient_vector(h1e, eri, mo_occ, x, mask)
+    minus = _exact_gradient_vector(h1e, eri, mo_occ, -x, mask)
+    return (plus - minus) * (norm / (4.0 * step))
+
+
+def hessian_diagonal_estimate(h1e, eri, mo_occ):
+    """Orbital-energy differences F_pp - F_qq per rotation and spin channel: the
+    preconditioner of the iterative Hessian solves."""
+    mask = rotation_mask(mo_occ)
+    dm_a, dm_b = densities(mo_occ)
+    v_a, v_b = general_veff(eri, dm_a, dm_b)
+    f_a, f_b = np.diag(h1e + v_a), np.diag(h1e + v_b)
+    occ = np.asarray(mo_occ)
+    occ_a, occ_b = occ > 0, occ == 2
+    var_a = (~occ_a).reshape(-1, 1) & occ_a
+    var_b = (~occ_b).reshape(-1, 1) & occ_b
+    d = np.zeros(mask.shape)
+    d[var_a] += (f_a[:, None] - f_a[None, :])[var_a]
+    d[var_b] += (f_b[:, None] - f_b[None, :])[var_b]
+    return d[mask]
+
+
+def lowest_hessian_modes(h1e, eri, mo_occ, nroots=1, tol=1e-8, max_cycle=200,
+                         step=1e-4, dense_below=64):
+    """The ``nroots`` lowest eigenpairs of the orbital Hessian (orbital_hessian's scale).
+
+    Davidson on Hessian-vector products (hessian_vector), about 2 gradient evaluations
+    per product instead of 2 per rotation; with fewer than ``dense_below`` rotations the
+    finite-difference Hessian is built and diagonalized.  Returns (eigenvalues,
+    eigenvectors as columns, converged, number of products).
+    """
+    from pyscf import lib
+
+    mask = rotation_mask(mo_occ)
+    n = int(mask.sum())
+    if n <= max(dense_below, 2 * nroots + 2):
+        w, v = np.linalg.eigh(orbital_hessian(h1e, eri, mo_occ, step))
+        return w[:nroots], v[:, :nroots], True, n
+    diag = hessian_diagonal_estimate(h1e, eri, mo_occ)
+    count = [0]
+
+    def aop(xs):
+        count[0] += len(xs)
+        return [hessian_vector(h1e, eri, mo_occ, x, step, mask) for x in xs]
+
+    def precond(r, e, x0):
+        d = diag - e
+        return r / np.where(np.abs(d) > 1e-4, d, np.copysign(1e-4, d))
+
+    # Unit vectors alone can miss a whole symmetry block (Davidson never leaves the
+    # space it starts in): a fixed random vector breaks the symmetry, and two extra
+    # roots catch a degenerate lowest pair.
+    nsolve = min(nroots + 2, n - 1)
+    guesses = []
+    for p in np.argsort(diag)[:nsolve + 2]:
+        unit = np.zeros(n)
+        unit[p] = 1.0
+        guesses.append(unit)
+    noise = np.random.default_rng(20261027).standard_normal(n)
+    guesses.append(noise / np.linalg.norm(noise))
+    conv, e, x = lib.davidson1(aop, guesses, precond, tol=tol, max_cycle=max_cycle,
+                               max_space=max(24, 4 * nsolve), nroots=nsolve)
+    e = np.atleast_1d(e)
+    x = np.asarray(x).reshape(len(e), n).T
+    order = np.argsort(e)[:nroots]
+    return e[order], x[:, order], bool(np.all(conv)), count[0]
+
+
 def orbital_hessian(h1e, eri, mo_occ, step=1e-4):
     mask = rotation_mask(mo_occ)
     n = int(mask.sum())
@@ -81,16 +178,20 @@ def orbital_hessian(h1e, eri, mo_occ, step=1e-4):
     return 0.5 * (hess + hess.T)
 
 
-def stability_analysis(h1e, eri, mo_occ, step=1e-4):
-    hess = orbital_hessian(h1e, eri, mo_occ, step)
-    eigenvalues, eigenvectors = np.linalg.eigh(hess)
+def stability_analysis(h1e, eri, mo_occ, step=1e-4, nroots=1, **kwargs):
+    """The lowest ``nroots`` orbital-Hessian eigenpairs (lowest_hessian_modes).
+    ``n_negative`` counts negative eigenvalues among those computed only."""
+    eigenvalues, eigenvectors, converged, products = lowest_hessian_modes(
+        h1e, eri, mo_occ, nroots=nroots, step=step, **kwargs)
     return {
         "eigenvalues": eigenvalues,
         "lowest": float(eigenvalues[0]),
         "n_negative": int((eigenvalues < -1e-8).sum()),
-        "is_minimum": bool((eigenvalues > -1e-8).all()),
+        "is_minimum": bool(eigenvalues[0] > -1e-8),
         "gradient_norm": float(
             np.linalg.norm(orbital_gradient(h1e, eri, mo_occ))
         ),
         "lowest_mode": eigenvectors[:, 0],
+        "converged": converged,
+        "hessian_vector_products": products,
     }

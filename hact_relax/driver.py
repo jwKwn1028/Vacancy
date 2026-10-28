@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 
+from pyscf import lib
 from pyscf.geomopt import geometric_solver
 from pyscf.geomopt.addons import as_pyscf_method
 
@@ -40,6 +41,7 @@ from hact_relax.geometry import (
     read_xyz,
     write_xyz,
 )
+from hact_relax.analytic_relax import AnalyticGradientScanner
 from hact_relax.gradient import (
     FiniteDifferenceScanner,
     SemiAnalyticGradientScanner,
@@ -193,8 +195,7 @@ def _hbn_geometry(args, case_name, fragment, input_xyz):
     shortest_ang = check_geometry_fits_supercell(
         coords_bohr, lattice_bohr, input_description
     )
-    # Only the fragment's real atoms move; the ghost site keeps its basis where
-    # the boron was.
+    # Only the fragment's real atoms move; the ghost keeps the boron's basis.
     movable = fragment_movable_atoms(
         labels, coords_bohr, lattice_bohr, vacancy_index, fragment
     )
@@ -256,7 +257,8 @@ def run_configuration(
     points_per_gradient: int,
 ) -> dict:
     case = CASES[case_name]
-    semi_analytic = bool(getattr(args, "semi_analytic_gradient", False))
+    gradient = str(getattr(args, "gradient", "fd"))
+    semi_analytic = gradient == "semi-analytic"
     cas_selection = _cas_selection(args, case)
     return {
         "host": case.host,
@@ -334,12 +336,20 @@ def run_configuration(
         "follow_mode_tol": 1e-8,
         "min_subspace_overlap": float(args.min_subspace_overlap),
         "min_center_subspace_overlap": float(args.min_center_subspace_overlap),
-        "gradient_policy": (
-            "semi-analytic: active space frozen at the displaced points"
-            if semi_analytic else
-            "finite difference: active space relaxed at every point"
-        ),
+        "gradient": gradient,
+        "gradient_policy": {
+            "analytic": "analytic: fragment fit, pristine Z-vector, Newton-polished centre",
+            "semi-analytic": "semi-analytic: active space frozen at the displaced points",
+            "fd": "finite difference: active space relaxed at every point",
+        }[gradient],
         "semi_analytic_gradient": semi_analytic,
+        "analytic_branch_tol_hartree": float(getattr(args, "branch_tol", 1e-5)),
+        "analytic_zvector_tol": float(getattr(args, "zvector_tol", 1e-10)),
+        "analytic_bath_kept_min": float(getattr(args, "bath_kept_min", 1e-5)),
+        "analytic_bath_cut_ratio_max": float(getattr(args, "bath_cut_ratio_max", 1e-3)),
+        "analytic_restart_from": (
+            None if getattr(args, "restart_state", None) is None
+            else os.fspath(args.restart_state.path)),
         "fd_step_bohr": float(args.fd_step),
         "fd_axes": str(args.fd_axes),
         "fd_mode": str(args.fd_mode),
@@ -412,6 +422,7 @@ def run_one(
     output_dir = unique_output_dir(args.output_dir, output_stem)
     output_dir.mkdir(parents=True)
 
+    analytic = getattr(args, "gradient", "fd") == "analytic"
     settings = SurfaceSettings(
         case_name=case_name,
         fragment=fragment,
@@ -456,6 +467,7 @@ def run_one(
         split_primitive_lattice_bohr=split_lattice,
         split_fit=str(getattr(args, "split_fit", None) or "fragment"),
         split_fit_precision=(float(getattr(args, "split_fit_precision", 1e-12)) or None),
+        split_fit_explicit_atoms=(tuple(int(a) for a in movable) if analytic else ()),
     )
     driver_mol = build_driver_molecule(
         labels, coords_bohr, case, args.basis, args.memory_mb, args.verbose
@@ -470,6 +482,7 @@ def run_one(
     write_xyz(initial_xyz, labels, coords_bohr, input_description)
 
     trajectory = TrajectoryRecorder(output_dir, labels)
+    energy_only = bool(getattr(args, "energy_only", False))
     scanner_type = (
         SemiAnalyticGradientScanner
         if getattr(args, "semi_analytic_gradient", False)
@@ -480,7 +493,7 @@ def run_one(
         run_configuration(
             args, case_name, fragment, labels, vacancy_index, movable,
             output_dir, input_description, geometry_fields,
-            1 if getattr(args, "energy_only", False) else
+            1 if energy_only or analytic else
             point_count_per_gradient(movable, args.fd_axis_indices, args.fd_mode),
         ),
         resource_interval_seconds=float(
@@ -494,19 +507,34 @@ def run_one(
         lattice_bohr,
         recorder=recorder,
     )
-    # --energy-only: hand the scanner no movable atoms, so one call evaluates the
-    # centre and skips every displaced point.  Doing it here rather than with a
-    # branch below keeps last_energy/last_coords/last_gradient populated, so
-    # final.xyz, the trajectory and the summary are written exactly as usual.
-    scanner = scanner_type(
-        surface,
-        () if getattr(args, "energy_only", False) else movable,
-        args.fd_step,
-        args.max_gradient,
-        axes=args.fd_axis_indices,
-        mode=args.fd_mode,
-        trajectory=trajectory,
-    )
+    # --energy-only: no movable atoms, so one call evaluates the centre and the outputs
+    # are written as usual.
+    if analytic:
+        scanner = AnalyticGradientScanner(
+            surface,
+            () if energy_only else movable,
+            axes=args.fd_axis_indices,
+            trajectory=trajectory,
+            branch_tol=float(args.branch_tol),
+            zvector_tol=float(args.zvector_tol),
+            bath_kept_min=float(args.bath_kept_min),
+            bath_cut_ratio_max=float(args.bath_cut_ratio_max),
+            restart=getattr(args, "restart_state", None),
+        )
+    else:
+        scanner = scanner_type(
+            surface,
+            () if energy_only else movable,
+            args.fd_step,
+            args.max_gradient,
+            axes=args.fd_axis_indices,
+            mode=args.fd_mode,
+            trajectory=trajectory,
+        )
+    # A restart hands geomeTRIC the saved Hessian; PySCF would overwrite a file: Hessian.
+    restart_hessian = getattr(getattr(scanner, "restart", None), "hessian_file", None)
+    hessian_options = ({} if restart_hessian is None else
+                       {"hessian": "file:%s" % restart_hessian, "frequency": False})
 
     constraints_path = None if args.coordsys == "cart" else constraints
     patch_geometric_for_ghost_atoms()
@@ -522,21 +550,27 @@ def run_one(
                 energy, gradient = scanner(driver_mol)
                 relaxed = driver_mol
             else:
-                geometry_converged, relaxed = geometric_solver.kernel(
-                    method,
-                    include_ghost=True,
-                    maxsteps=args.maxsteps,
-                    constraints=(os.fspath(constraints_path)
-                                 if constraints_path else None),
-                    assert_convergence=not args.allow_unconverged_geometry,
-                    convergence_energy=args.convergence_energy,
-                    convergence_grms=args.convergence_grms,
-                    convergence_gmax=args.convergence_gmax,
-                    convergence_drms=args.convergence_drms,
-                    convergence_dmax=args.convergence_dmax,
-                    tmax=args.tmax,
-                    coordsys=args.coordsys,
-                )
+                keep_hessian = (
+                    contextlib.nullcontext() if restart_hessian is None else
+                    lib.temporary_env(geometric_solver,
+                                      _make_hessian=lambda g, option, tmp: option))
+                with keep_hessian:
+                    geometry_converged, relaxed = geometric_solver.kernel(
+                        method,
+                        include_ghost=True,
+                        maxsteps=args.maxsteps,
+                        constraints=(os.fspath(constraints_path)
+                                     if constraints_path else None),
+                        assert_convergence=not args.allow_unconverged_geometry,
+                        convergence_energy=args.convergence_energy,
+                        convergence_grms=args.convergence_grms,
+                        convergence_gmax=args.convergence_gmax,
+                        convergence_drms=args.convergence_drms,
+                        convergence_dmax=args.convergence_dmax,
+                        tmax=args.tmax,
+                        coordsys=args.coordsys,
+                        **hessian_options,
+                    )
                 geometry_converged = bool(geometry_converged)
                 energy = scanner.last_energy
                 gradient = scanner.last_gradient

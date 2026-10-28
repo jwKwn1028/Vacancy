@@ -61,12 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="hBN-2D: in-plane lattice constant, Angstrom")
     parser.add_argument("--wrap-about-vacancy",
                         action=argparse.BooleanOptionalAction, default=None,
-                        help="place every atom at its image nearest the vacancy "
-                             "for the cluster ERIs and the Eq. 16/19 vacancy "
-                             "terms, which are not lattice-summed.  Defaults "
-                             "on for hBN-2D, whose 60-degree supercell is a "
-                             "rhombus rather than the hexagon of nearest images, "
-                             "and off for LiH-1D/LiF-1D, whose vacancy is mid-chain")
+                        help="place atoms at their images nearest the vacancy for the "
+                             "cluster ERIs and vacancy terms (default on for hBN-2D)")
     parser.add_argument("--vacuum", type=float, default=30.0)
     parser.add_argument("--reference", choices=("gamma", "kmesh"),
                         default="gamma",
@@ -77,9 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "the supercell density fitting.  The "
                              "k-mesh is the perfect crystal, so it needs the "
                              "ideal lattice and --single-point --energy-only")
-    parser.add_argument("--split", action="store_true",
-                        help="Gamma reference whose ERIs outside the fragment "
-                             "come from the ideal crystal's k-point GDF")
+    parser.add_argument("--split", action=argparse.BooleanOptionalAction, default=None,
+                        help="Gamma reference with the ideal crystal's k-point fit "
+                             "outside the fragment (default on with --reference gamma)")
     parser.add_argument("--split-fit", choices=("fragment", "gamma"), default=None,
                         help="with --split: 'fragment' (default) builds the exact Gamma "
                              "fit from the k-point one and the moved atoms' integrals "
@@ -87,9 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "attraction; 'gamma' fits the fragment's ERIs with a Gamma "
                              "GDF of the supercell")
     parser.add_argument("--split-fit-precision", type=float, default=1e-12,
-                        help="the fragment fit's precision for its explicit integrals "
-                             "(the moved atoms' rows, moving auxiliary functions), which "
-                             "change with the geometry; 0 takes the cell's (1e-8)")
+                        help="precision of the fragment fit's moving parts; 0 takes the "
+                             "cell's")
     parser.add_argument("--coordsys", default="cart",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
 
@@ -97,10 +92,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scf-max-cycle", type=int, default=200)
     parser.add_argument("--scf-conv-tol", type=float, default=1e-9)
     parser.add_argument("--scf-conv-tol-grad", type=float, default=1e-6)
-    parser.add_argument("--rescue-unconverged-scf", action="store_true")
+    parser.add_argument("--rescue-unconverged-scf", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="finish an unconverged embedded SCF by L-BFGS and Newton "
+                             "(default on)")
     parser.add_argument("--rescue-tol-factor", type=float, default=5.0)
-    parser.add_argument("--follow-negative-mode", action="store_true")
-    parser.add_argument("--min-subspace-overlap", type=float, default=0.5)
+    parser.add_argument("--follow-negative-mode", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="follow a negative orbital-Hessian mode both ways to the "
+                             "lower minimum (default on)")
+    parser.add_argument("--min-subspace-overlap", type=float, default=None,
+                        help="co-moving active-space overlap below which a displaced "
+                             "point stops and a centre restarts its SCF (default 0.5; 0 "
+                             "with the analytic gradient)")
     parser.add_argument("--min-center-subspace-overlap", type=float, default=0.0)
 
     parser.add_argument("--state", choices=("ground", "excited"),
@@ -109,34 +113,22 @@ def build_parser() -> argparse.ArgumentParser:
                              "excited: relax on a tracked CASCI root of the "
                              "same H_act^V")
     parser.add_argument("--root", type=int, default=1,
-                        help="zero-based CASCI root, selected by energy at the "
-                             "first accepted centre and by maximum CI overlap "
-                             "thereafter")
+                        help="zero-based CASCI root, by energy at the first centre and CI "
+                             "overlap after")
     parser.add_argument("--nroots", type=int, default=4)
     parser.add_argument("--ncas", type=int,
                         help="CAS orbitals; defaults to the case value")
     parser.add_argument("--ncas-elec", type=int,
                         help="CAS electrons; defaults to the case value")
     parser.add_argument("--casci-two-s", type=int, default=None,
-                        help="CASCI spin sector as 2S (0 = singlet, 2 = "
-                             "triplet).  Defaults to the case's own spin. "
-                             "H_act^V is spin-free, so the same Hamiltonian can "
-                             "be diagonalized in another sector")
+                        help="CASCI spin sector as 2S (default: the case's spin)")
     parser.add_argument("--min-casci-root-overlap", type=float, default=0.5,
                         help="abort if no CASCI root overlaps the tracked state "
                              "by this much")
     parser.add_argument("--cas-weight-gap-tol", type=float, default=1e-3,
-                        help="minimum relative gap in vacancy weight between the "
-                             "least local CAS orbital and the most local one "
-                             "left out.  Below this the cut runs through a "
-                             "degenerate set and the CAS would break the "
-                             "symmetry of the model")
+                        help="smallest relative vacancy-weight gap at the CAS edge")
     parser.add_argument("--cas-weight-floor", type=float, default=0.1,
-                        help="a selected CAS orbital must carry at least this "
-                             "Mulliken population on the vacancy site.  Zero "
-                             "disables the check, which is the escape hatch for "
-                             "a defect whose localized states all sit in one "
-                             "manifold")
+                        help="smallest vacancy population of a CAS orbital (0: off)")
     parser.add_argument("--allow-degenerate-cas", action="store_true",
                         help="warn instead of aborting when the CAS window "
                              "cuts through a degenerate set")
@@ -147,14 +139,31 @@ def build_parser() -> argparse.ArgumentParser:
                              "frontier.  Defaults to the case's choice: "
                              "vacancy-local for LiH, energy for LiF and hBN")
     parser.add_argument("--cas-energy-gap-tol", type=float, default=1e-4,
-                        help="with --cas-selection energy, the smallest orbital-"
-                             "energy gap (Ha) allowed at either edge of the "
-                             "window")
+                        help="with --cas-selection energy, the smallest orbital-energy "
+                             "gap (Ha) at the window's edges")
 
+    parser.add_argument("--gradient", choices=("auto", "analytic", "fd", "semi-analytic"),
+                        default="auto",
+                        help="auto (default): analytic for the ground state with --split "
+                             "and the fragment fit, finite differences otherwise")
+    parser.add_argument("--branch-tol", type=float, default=1e-5,
+                        help="analytic: allowed trapezoid-rule mismatch between "
+                             "consecutive points (Ha), plus a quarter of the step's "
+                             "curvature")
+    parser.add_argument("--zvector-tol", type=float, default=1e-10,
+                        help="analytic: the pristine Z-vector's Krylov tolerance")
+    parser.add_argument("--bath-kept-min", type=float, default=1e-5,
+                        help="analytic: smallest kept bath singular value (0: off)")
+    parser.add_argument("--bath-cut-ratio-max", type=float, default=1e-3,
+                        help="analytic: largest dropped over smallest kept bath singular "
+                             "value (1: off)")
+    parser.add_argument("--restart", type=Path, default=None,
+                        help="analytic: continue the run in this directory from its "
+                             "restart.npz")
     parser.add_argument("--fd-step", type=float, default=1e-3)
     parser.add_argument("--fd-axes", default=None,
-                        help="Cartesian axes of the central differences; "
-                             "defaults to x for LiH-1D/LiF-1D and xy for hBN-2D")
+                        help="axes the movable atoms relax along (default x for chains, "
+                             "xy for hBN-2D)")
     parser.add_argument("--fd-mode", default="central",
                         choices=("central", "forward"))
     parser.add_argument("--max-gradient", type=float, default=1.0)
@@ -171,16 +180,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-unconverged-geometry", action="store_true")
     parser.add_argument("--single-point", action="store_true")
     parser.add_argument("--energy-only", action="store_true",
-                        help="with --single-point, evaluate only the centre and "
-                             "skip the finite-difference displacements.  The "
-                             "reported gradient is then zero, not converged")
+                        help="with --single-point, evaluate only the centre (gradient "
+                             "zero)")
 
     parser.add_argument("--resource-interval", type=float, default=30.0)
     parser.add_argument("--no-eri-checkpoint", action="store_true",
-                        help="leave the active ERIs out of hact.chk and "
-                             "hact_input.chk; smaller files, but the CASCI and "
-                             "the offline re-solve (hact_relax/resolve_hact.py) "
-                             "then cannot run from them")
+                        help="leave the active ERIs out of the checkpoints (no offline "
+                             "re-solve or CASCI then)")
 
     parser.add_argument("--threads", type=int, default=THREADS)
     parser.add_argument("--memory-mb", type=int,
@@ -213,6 +219,8 @@ def validate_args(parser: argparse.ArgumentParser, args):
             "displacements and relaxation steps break its periodicity, so it needs "
             "--single-point --energy-only"
         )
+    if args.split is None:
+        args.split = args.reference == "gamma"
     if args.split and args.reference != "gamma":
         parser.error("--split is a Gamma reference; drop --reference kmesh")
     if args.split_fit is not None and not args.split:
@@ -221,6 +229,25 @@ def validate_args(parser: argparse.ArgumentParser, args):
         parser.error("--split-fit-precision must not be negative (0 takes the cell's)")
     if args.split and args.split_fit is None:
         args.split_fit = "fragment"
+    if args.semi_analytic_gradient:
+        if args.gradient not in ("auto", "semi-analytic"):
+            parser.error("--semi-analytic-gradient conflicts with --gradient %s"
+                         % args.gradient)
+        args.gradient = "semi-analytic"
+    analytic_ok = args.split and args.split_fit == "fragment" and args.state == "ground"
+    if args.gradient == "auto":
+        args.gradient = "analytic" if analytic_ok else "fd"
+    elif args.gradient == "analytic" and not analytic_ok:
+        parser.error("--gradient analytic needs --split with the fragment fit and "
+                     "--state ground")
+    args.semi_analytic_gradient = args.gradient == "semi-analytic"
+    if args.min_subspace_overlap is None:
+        args.min_subspace_overlap = 0.0 if args.gradient == "analytic" else 0.5
+    if args.branch_tol <= 0.0 or args.zvector_tol <= 0.0:
+        parser.error("--branch-tol and --zvector-tol must be positive")
+    if args.bath_kept_min < 0.0 or not 0.0 < args.bath_cut_ratio_max <= 1.0:
+        parser.error("--bath-kept-min must not be negative and --bath-cut-ratio-max "
+                     "must lie in (0, 1]")
     if args.memory_mb < 1 or args.fd_step <= 0 or args.maxsteps < 1:
         parser.error("--memory-mb, --fd-step and --maxsteps must be positive")
     if args.max_gradient <= 0.0 or args.bath_tol <= 0.0:
@@ -307,6 +334,23 @@ def validate_args(parser: argparse.ArgumentParser, args):
                 % (largest, natm, args.hbn_cells, args.hbn_cells)
             )
     args.output_dir = args.output_dir.expanduser().resolve()
+    args.restart_state = None
+    if args.restart is not None:
+        from hact_relax.analytic_relax import Restart
+
+        if args.gradient != "analytic":
+            parser.error("--restart continues an analytic-gradient run")
+        if args.xyz is not None:
+            parser.error("--restart sets the geometry; drop --xyz")
+        try:
+            restart = Restart(args.restart)
+        except FileNotFoundError as exc:
+            parser.error(str(exc))
+        if [*cases, *fragments] != [restart.case, restart.fragment]:
+            parser.error("--restart continues %s fragment %d; got %s %s"
+                         % (restart.case, restart.fragment, args.cases, args.fragments))
+        args.xyz = restart.write_xyz()
+        args.restart_state = restart
     return cases, fragments
 
 

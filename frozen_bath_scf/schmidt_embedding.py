@@ -33,7 +33,7 @@ class _SchmidtEmbedding:
                    seed_vacancy=False, vacancy_index=None,
                    fixed_n_bath=None, fixed_fragment_atoms=None,
                    compute_core_energy=True, auxbasis=None,
-                   wrap_about_vacancy=False):
+                   wrap_about_vacancy=False, keep_cluster_df=False):
         self.kmf = kmf
         self.kmesh = list(kmesh)
         self.vac_species = vac_species
@@ -53,6 +53,9 @@ class _SchmidtEmbedding:
         self.compute_core_energy = bool(compute_core_energy)
         self.auxbasis = auxbasis
         self.wrap_about_vacancy = bool(wrap_about_vacancy)
+        # Keep the cluster ERIs' DF object (its Cholesky vectors), for the analytic gradient.
+        self.keep_cluster_df = bool(keep_cluster_df)
+        self.cluster_df = None
 
         self.mo_coeff = self.mo_occ = self.active_orb = None
         self.mo_occ_D = None
@@ -502,6 +505,8 @@ class _SchmidtEmbedding:
 
         dfobj = mol_df.DF(mol)
         dfobj.build()
+        if self.keep_cluster_df:
+            self.cluster_df = dfobj
         nao = mol.nao_nr()
         Lij_chunks = []
         for Lpq in dfobj.loop():

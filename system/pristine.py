@@ -55,13 +55,11 @@ def build_pristine_mean_field(
     split=None,
     fit_records=None,
     fit_precision=1e-12,
+    fit_explicit=(),
 ):
-    """The pristine KRHF.  ``split`` = (outside, atoms) replaces the Gamma GDF: a
-    split_fit.KpointOutside gives the split fit (k-point ERIs outside the fragment ``atoms``,
-    Gamma inside), a fragment_fit.KpointFit the fragment fit (the exact Gamma fit from the
-    k-point one).  A list ``fit_records`` collects the GDF builder and its metric factors,
-    which a fragment_fit.KpointFit of this mean field needs; ``fit_precision`` is the
-    fragment fit's, for the parts that move with the atoms."""
+    """The pristine KRHF. ``split`` = (outside, atoms) replaces the Gamma GDF: a
+    KpointOutside gives the split fit, a KpointFit the fragment fit (``fit_precision``,
+    ``fit_explicit``). ``fit_records`` collects the GDF's metric factors for a KpointFit."""
     from pyscf.pbc import gto, scf
 
     cell = gto.Cell()
@@ -86,7 +84,8 @@ def build_pristine_mean_field(
             raise ValueError("split integrals need the Gamma supercell")
         outside, atoms = split
         if isinstance(outside, KpointFit):
-            kmf.with_df = FragmentFit(outside, cell, atoms, precision=fit_precision)
+            kmf.with_df = FragmentFit(outside, cell, atoms, precision=fit_precision,
+                                      explicit=fit_explicit)
         else:
             kmf.with_df = SplitDensityFit(kmf.with_df, outside, fragment_aos(cell, atoms))
     kmf.conv_tol = float(conv_tol)

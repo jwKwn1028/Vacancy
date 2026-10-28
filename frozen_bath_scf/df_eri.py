@@ -1,9 +1,5 @@
-"""Active-space two-electron integrals as density-fitting factors.
-
-(ij|kl) = sum_P s_P L_Pij L_Pkl, with L real and symmetric in ij and s_P = +-1.  The
-cluster's Cholesky vectors give exactly the ERIs the embedding used to store densely,
-in naux x n^2 numbers instead of n^4.  The functions here take either form, so a dense
-(n, n, n, n) array from an old checkpoint or a test still works.
+"""Active-space ERIs as density-fitting factors, (ij|kl) = sum_P s_P L_Pij L_Pkl with
+s_P = +-1.  The functions also take a dense (n, n, n, n) array.
 """
 import numpy as np
 

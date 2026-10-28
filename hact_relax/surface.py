@@ -50,8 +50,7 @@ from hact_relax.tracking import (
 
 def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=None,
                            rotation=None):
-    """``result`` with its active orbitals rotated by exp(kappa), or by ``rotation``.
-    """
+    """``result`` with its active orbitals rotated by exp(kappa), or by ``rotation``."""
     h1e = np.asarray(result[5]).real
     eri = as_eri(result[6])
     occ = np.asarray(result[4]).real
@@ -78,14 +77,9 @@ def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=Non
 
 
 def minimize_and_finish(h1e, eri, occ, x0, newton_tol, escapes=2):
-    """L-BFGS at fixed occupations from ``x0``, then a Newton finish to an orbital
-    gradient of ``newton_tol`` (orbital_optimizer.newton_finish).  Returns the rotation,
-    its energy, the final gradient norm and the Newton record.
-
-    L-BFGS can stop next to a saddle (a soft negative mode changes the energy below its
-    line search's resolution), where the Newton finish refuses to step.  Then the lowest
-    mode is followed down both ways and the lower minimum kept, at most ``escapes``
-    times (``saddle_escapes`` in the record)."""
+    """L-BFGS from ``x0``, then a Newton finish to ``newton_tol``; at a saddle the lowest
+    mode is followed both ways, at most ``escapes`` times.  Returns the rotation, energy,
+    gradient norm and record."""
     _, kappa = minimize_orbitals(h1e, eri, occ, x0)
     u = so._expm_antisym(kappa)
     h1e, eri = rotate_hamiltonian(h1e, eri, u)
@@ -111,12 +105,8 @@ def minimize_and_finish(h1e, eri, occ, x0, newton_tol, escapes=2):
 
 
 def rescue_unconverged(result, gradient_limit, newton_tol=None):
-    """Finish an unconverged frozen-bath SCF at fixed occupations (minimize_and_finish,
-    Newton to ``newton_tol``, default ``gradient_limit``).
-
-    Accepted when the final orbital gradient is at most ``gradient_limit``; the
-    accepted solution is canonical (``apply_orbital_rotation``).
-    """
+    """Finish an unconverged frozen-bath SCF (minimize_and_finish); accepted, canonical, if
+    its gradient is at most ``gradient_limit``."""
     if result[5] is None or result[6] is None:
         return result, {"scf_rescued": False}
     h1e = np.asarray(result[5]).real
@@ -140,14 +130,8 @@ def rescue_unconverged(result, gradient_limit, newton_tol=None):
 
 
 def follow_negative_mode(result, tol, newton_tol=1e-9):
-    """Follow the lowest orbital-Hessian mode if it is below -``tol``, to a minimum
-    finished by Newton steps to an orbital gradient of ``newton_tol``.
-
-    The eigenvector's sign is arbitrary, and the two directions can end in different
-    minima, so both are followed and the lower minimum is kept (the + direction when
-    they agree to 1e-10 Ha).  Returns the result, whether a mode was followed, and the
-    record fields.  A followed solution is canonical (``apply_orbital_rotation``).
-    """
+    """Follow the lowest orbital-Hessian mode below -``tol`` both ways and keep the lower
+    minimum, canonical.  Returns the result, whether a mode was followed, and the record."""
     h1e = np.asarray(result[5]).real
     eri = as_eri(result[6])
     occ = np.asarray(result[4]).real
@@ -198,9 +182,9 @@ class SurfaceSettings:
     min_center_subspace_overlap: float
     verbose: int
     auxbasis: str | None = None
-    follow_negative_mode: bool = False
+    follow_negative_mode: bool = True
     follow_mode_tol: float = 1e-8
-    rescue_unconverged_scf: bool = False
+    rescue_unconverged_scf: bool = True
     rescue_tol_factor: float = 5.0
     checkpoint_eri: bool = True
     # --state excited: CASCI on H_act^V instead of the frozen-bath SCF energy.
@@ -223,15 +207,15 @@ class SurfaceSettings:
     split_kmesh: tuple[int, int, int] | None = None
     split_primitive_atoms: list | None = None
     split_primitive_lattice_bohr: np.ndarray | None = None
-    # "fragment": the fragment fit, the exact Gamma fit built from the k-point one
-    # (system/fragment_fit.py); "gamma": the split fit (Gamma inside the fragment).
+    # "fragment": the exact Gamma fit from the k-point one; "gamma": Gamma inside only.
     split_fit: str = "fragment"
     # Thresholds of the ideal crystal's k-point SCF; None takes scf_conv_tol(_grad).
     split_kpoint_conv_tol: float | None = None
     split_kpoint_conv_tol_grad: float | None = None
-    # The fragment fit's precision for the parts that move with the atoms; None takes
-    # the cell's (PySCF's 1e-8), whose screening errors change with the geometry.
+    # Precision of the fragment fit's moving parts; None takes the cell's.
     split_fit_precision: float | None = 1e-12
+    # Atoms the fragment fit treats as moved at every geometry.
+    split_fit_explicit_atoms: tuple[int, ...] = ()
 
 
 class ActiveHamiltonianSurface:
@@ -254,6 +238,8 @@ class ActiveHamiltonianSurface:
         self.lattice_bohr = np.asarray(lattice_bohr, dtype=float)
         self.cache: dict[str, float] = {}
         self.last_accepted_key: str | None = None
+        # energy(keep_point=True) keeps the accepted centre's mean field and solver.
+        self.kept_centre: dict | None = None
         self.pristine_reference: PristineReference | None = None
         self.active_solution_reference: ActiveSolutionReference | None = None
         self.casci_reference: CASCIReference | None = None
@@ -512,6 +498,7 @@ class ActiveHamiltonianSurface:
         accept_center: bool = False,
         displaced_atom: int | None = None,
         relax_active: bool = True,
+        keep_point: bool = False,
     ) -> float:
         if accept_center and not relax_active:
             raise ValueError(
@@ -633,6 +620,7 @@ class ActiveHamiltonianSurface:
                          if accept_center else None),
                 split=split,
                 fit_precision=settings.split_fit_precision,
+                fit_explicit=settings.split_fit_explicit_atoms,
             )
         record.update({
             "pristine_energy_hartree": float(pristine_kmf.e_tot) * ncells,
@@ -690,6 +678,7 @@ class ActiveHamiltonianSurface:
             fixed_fragment_atoms=self.fixed_fragment_atoms,
             auxbasis=settings.auxbasis,
             wrap_about_vacancy=settings.wrap_about_vacancy,
+            keep_cluster_df=keep_point and accept_center,
         )
         with self.recorder.stage(
             "embedding_build", evaluation=evaluation, reason=reason
@@ -790,10 +779,7 @@ class ActiveHamiltonianSurface:
             "input_checkpoint_saved": False,
         })
 
-        # Everything the frozen-bath SCF needs, written before it runs: a failed
-        # SCF can then be re-solved offline (hact_relax/resolve_hact.py) instead of
-        # repeating the pristine mean field and the embedding.
-        # A failed write costs the retry option, never the evaluation.
+        # Written before the SCF, so a failed one can be re-solved by resolve_hact.py.
         input_chkfile = getattr(self.recorder, "hact_input_chkfile", None)
         if accept_center and relax_active and input_chkfile is not None:
             try:
@@ -905,16 +891,12 @@ class ActiveHamiltonianSurface:
         casci = None
         if settings.state != "ground":
             if not relax_active and self.casci_reference is None:
-                # Without a tracked reference casci_energy orders the CAS window
-                # by SCF orbital energy -- and a frozen frame carries none
-                # (result[2] is zeros), so it would silently pick an arbitrary
-                # window and return a plausible number.
+                # A frozen frame has no orbital energies to order the CAS window by.
                 raise RuntimeError(
                     "a semi-analytic CASCI displacement requires an accepted "
                     "centre with a tracked CI reference"
                 )
-            # CASCI replaces the SCF active energy; the core terms are folded in
-            # by _fake_mf via energy_nuc, so casci.energy is already the total.
+            # casci.energy is already the total: _fake_mf folds the core terms in.
             with self.recorder.stage(
                 "casci", evaluation=evaluation, reason=reason
             ):
@@ -962,9 +944,7 @@ class ActiveHamiltonianSurface:
                 **(casci.selection or {}),
             })
 
-            # Guard 1 -- the CAS window must still be the same frame, or the CI
-            # vectors being compared are not comparable.  Tested on the window
-            # rather than on the whole active space, which drifts with the bath.
+            # Guard 1: the CAS window (not the whole active space) keeps its frame.
             if (casci.cas_window_min_overlap is not None
                     and casci.cas_window_min_overlap
                     < settings.min_subspace_overlap):
@@ -982,7 +962,7 @@ class ActiveHamiltonianSurface:
                        casci.orbital_min_overlap),
                     continuity_space="casci-active-orbitals",
                 )
-            # Guard 2 -- some root must still carry the tracked state.
+            # Guard 2: some root still carries the tracked state.
             if (selected_overlap is not None
                     and selected_overlap < settings.min_casci_root_overlap):
                 self.recorder.evaluation({
@@ -1007,8 +987,7 @@ class ActiveHamiltonianSurface:
                 "e1e_core_hartree": float(solver.E1e_core),
                 "e2e_core_hartree": float(solver.E2e_core),
                 "enuc_hartree": float(solver.Enuc),
-                # The relaxed surface and the underlying SCF total differ once
-                # --state excited is in play.
+                # Differs from the relaxed surface with --state excited.
                 "e_total_hact_v_hartree": float(
                     result[1] + solver.E1e_core + solver.E2e_core + solver.Enuc
                 ),
@@ -1053,6 +1032,8 @@ class ActiveHamiltonianSurface:
                 self.fixed_fragment_atoms = tuple(sorted(solver.frag_atoms))
             self.cache.clear()
             self.last_accepted_key = key
+            self.kept_centre = ({"kmf": pristine_kmf, "solver": solver}
+                                if keep_point else None)
             if self.recorder.hact_chkfile is not None:
                 with self.recorder.stage(
                     "checkpoint_write", evaluation=evaluation, reason=reason

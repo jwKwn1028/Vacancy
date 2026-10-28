@@ -1,35 +1,11 @@
-"""The Gamma density fit of a supercell whose moved atoms all lie in the fragment, built
-from the ideal crystal's k-point fit plus integrals that touch the moved atoms only.
+"""The Gamma density fit of a supercell whose moved atoms lie in the fragment, built from
+the ideal crystal's k-point fit plus integrals that touch the moved atoms.
 
-Two steps, each exact:
-
-1. Frozen auxiliary basis.  With the ideal supercell's auxiliary functions (the k-point
-   ones unfolded) the metric is the k-point metric, block-diagonal in the momentum p.  With
-   M_p the factor PySCF used for that block,
-
-       B^p_ab = M_p V^p_ab,   V^p_ab = N^-1/2 sum_R exp(-i p.R) (P_R|ab),
-       (ab|cd) = sum_p B^p_ab . B^-p_cd.
-
-   Pairs without a moved AO keep the k-point vectors (in k-space).  Pairs with one get
-   vectors from Gamma integrals over the moved atoms' rows, plus the seam: the k-point rows
-   minus the Gamma rows at the ideal geometry.  The real combinations sqrt2 Re B^p,
-   sqrt2 Im B^p (B^p when p = -p) are an orthonormal basis v of the fit's span; they index
-   the rows of the fragment vectors E[v, f, c].
-
-2. Moving auxiliary basis.  The moved atoms' auxiliary functions F are replaced by the
-   same functions at the new positions F'.  In the coordinates v this removes Q, the span
-   of F beyond the other functions, and adds the residuals of F' beyond them: a correction
-   of rank 2 |F|, built from (F'|ab) - (F|ab) and (F'|A) - (F|A), which vanish at the ideal
-   geometry.
-
-The nuclear attraction is assembled the same way: the k-point one unfolded, the moved
-atoms' rows from Gamma integrals over all nuclei (steep unit Gaussians as auxiliary
-functions) plus their seam, and the moved nuclei's change on every other pair.
-
-The explicit parts (rows, seam, moved pairs, moving-auxiliary metric) are built at their
-own precision, 1e-12 by default: the k-point fit is the same at every geometry, but these
-change with it, and screened at the cell's 1e-8 their errors move the energy by up to
-1e-4 Ha/Bohr on hBN.
+Pairs without a moved AO keep the k-point vectors; pairs with one get Gamma rows plus the
+seam (k-point minus Gamma rows at the ideal geometry).  The moved atoms' auxiliary functions
+are then moved by a rank-2|F| correction.  The nuclear attraction is assembled the same way.
+The explicit parts change with the geometry, so they are built at their own precision (1e-12
+by default).
 """
 import os
 import tempfile
@@ -81,9 +57,8 @@ def gamma_settings(cell, auxcell):
 
 
 class GammaBuilder(rsdf_builder._RSGDFBuilder):
-    """Raw Gamma (A|ab), without the metric.  PySCF sizes its batches by max_memory minus
-    the memory in use, which here includes the k-point fit: below two one-shell batches of
-    room the G blocks shrink to 16 points, so that much room is kept free."""
+    """Raw Gamma (A|ab), without the metric.  Keeps room for two one-shell batches, below
+    which PySCF shrinks its G blocks to 16 points."""
 
     def __init__(self, cell, auxcell, settings):
         super().__init__(cell, auxcell, np.zeros((1, 3)))
@@ -161,8 +136,8 @@ def h5_steps(builder, **kwargs):
 
 
 def fragment_vectors(cell, auxcell, atoms, kfit, settings, nuclear=False):
-    """M_p V^p for the rows on ``atoms``, {p: (naux_p, nrow, nao)} for p in kfit.half, and
-    with ``nuclear`` the same rows of the nuclear attraction (nrow, nao)."""
+    """M_p V^p for the rows on ``atoms``, {p: (naux_p, nrow, nao)}, and with ``nuclear`` the
+    nuclear attraction's rows."""
     nk, nao = kfit.nk, cell.nao_nr()
     naux = auxcell.nao_nr() // nk
     atoms = sorted(int(i) for i in atoms)
@@ -412,8 +387,8 @@ class KpointFit(KpointOutside):
         return self._vnuc
 
     def seam_rows(self, atoms, ideal, auxcell, settings, nuclear=False):
-        """k-point rows minus Gamma rows at the ideal geometry, per atom: the fit's (real
-        basis) and, with ``nuclear``, the nuclear attraction's."""
+        """k-point minus Gamma rows at the ideal geometry, per atom, and with ``nuclear``
+        the nuclear attraction's."""
         seams = self._seams.setdefault(float(ideal.precision), {})
         missing = [a for a in sorted(atoms)
                    if a not in seams or (nuclear and seams[a][1] is None)]
@@ -443,12 +418,11 @@ def moved_atoms(cell, ideal, tol=1e-6):
 
 
 class FragmentFit:
-    """The fit as a GDF stand-in for a Gamma KRHF of ``cell``.  With nuclear="kpoint" the
-    nuclear attraction is assembled from the k-point one, with "gamma" it is the supercell
-    GDF's; the rest delegates to a GDF of ``cell``."""
+    """The fit as a GDF stand-in for a Gamma KRHF of ``cell``; ``nuclear="kpoint"``
+    assembles the nuclear attraction from the k-point one."""
 
     def __init__(self, kfit, cell, fragment, *, nuclear="kpoint", seam=True, move_aux=True,
-                 column_tol=1e-12, batch=16, precision=1e-12):
+                 column_tol=1e-12, batch=16, precision=1e-12, explicit=()):
         if nuclear not in ("kpoint", "gamma"):
             raise ValueError("nuclear must be 'kpoint' or 'gamma'")
         if nuclear == "kpoint" and (cell.pseudo or len(cell._ecpbas)):
@@ -467,10 +441,12 @@ class FragmentFit:
         if [cell.atom_symbol(i) for i in range(cell.natm)] != [
                 ideal.atom_symbol(i) for i in range(ideal.natm)]:
             raise ValueError("the supercell does not list its atoms in the k-mesh order")
-        self.moved = moved_atoms(cell, ideal)
-        stray = sorted(set(self.moved) - set(self.fragment))
+        moved = moved_atoms(cell, ideal)
+        stray = sorted(set(moved) - set(self.fragment))
         if stray:
             raise ValueError("atoms %s outside the fragment have moved" % stray)
+        # Explicit atoms count as moved, so a relaxation's fit keeps one structure.
+        self.moved = sorted(set(moved) | {int(a) for a in explicit})
         auxcell = pbc_df.make_auxcell(ideal, kfit.auxbasis)
         self.settings = kfit.gamma_settings(ideal, auxcell)
         rows = fragment_aos(cell, self.moved)
@@ -529,8 +505,8 @@ class FragmentFit:
                 self.timings["nuclear"] = time.perf_counter() - t0
 
     def _pair_differences(self, cell, ideal, with_aux, with_nuc):
-        """For every AO pair, the moved atoms' auxiliary functions (packed, one per row) and
-        nuclei (unit charges) at their new positions minus at their ideal ones."""
+        """(A'|ab) - (A|ab) over every pair, for the moved atoms' auxiliary functions and
+        nuclei."""
         kfit = self.kfit
 
         def half(atoms):

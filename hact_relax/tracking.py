@@ -29,8 +29,8 @@ class ActiveSolutionReference:
 
 @dataclass
 class SubspaceMatch:
-    """The co-moving overlap of two orbital spaces (each AO carried with its atom), its
-    SVD, and the spatial overlap's singular values when the lattice is unchanged."""
+    """The co-moving overlap of two orbital spaces and its SVD, with the spatial overlap's
+    singular values when the lattice is unchanged."""
     overlap: np.ndarray
     left: np.ndarray
     singular_values: np.ndarray
@@ -207,8 +207,7 @@ def transport_active_solution(
 
 
 def defect_orbital_index(solver, active_coeff, occupations=None):
-    """The active orbital the tracked defect orbital is now, by overlap.
-    """
+    """The active orbital the tracked defect orbital is now, by overlap."""
     c_def = getattr(solver, "_c_def", None)
     if c_def is None:
         return None
@@ -274,30 +273,15 @@ def make_pristine_reference(kmf) -> PristineReference:
 
 
 # ---------------------------------------------------------------------------
-# CASCI on H_act^V, with maximum-overlap orbital and root tracking.
-#
-# The relaxation needs the SAME excited state at every finite-difference point,
-# which is two separate tracking problems:
-#
-#   1. the active orbitals must be put in a common frame across geometries,
-#      otherwise CI vectors from two geometries are not comparable at all;
-#   2. within that frame, the root carrying the tracked state must be identified,
-#      since CASCI returns roots in energy order and roots cross.
-#
-# (1) is a Hungarian assignment on the cross-geometry AO overlap plus a sign fix;
-# (2) is a modulus CI overlap against the last accepted centre.
+# CASCI on H_act^V, tracking the state across geometries: the orbitals by a Hungarian
+# match on the cross-geometry overlap (with signs), the root by CI overlap.
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class CASCIReference:
-    """The tracked state at the last accepted centre.
-
-    ``ordered_active_coeff`` is stored in the order the first centre chose, so
-    the Hungarian match reproduces that window later without re-scoring
-    locality; the window definition is latched alongside it so a shift in the
-    active electron count cannot slide the CAS inside that ordering.
-    """
+    """The tracked state at the last accepted centre, its active orbitals in the first
+    centre's order, and the latched window definition."""
 
     cell: object
     ordered_active_coeff: np.ndarray
@@ -338,9 +322,7 @@ def _normalized_ci_overlaps(
     for vector in vectors:
         vec = np.asarray(vector)
         if vec.shape != ref.shape:
-            # CI vector shape is (n_alpha_strings, n_beta_strings) and therefore
-            # spin-sector dependent.  Ravelling mismatched shapes would compare
-            # unrelated determinants and silently return a plausible number.
+            # The CI shape depends on the spin sector; mismatched shapes are not comparable.
             raise ValueError(
                 "CI vector shape %s does not match the tracked reference %s; "
                 "the CAS or the spin sector changed between geometries"
@@ -354,10 +336,8 @@ def _normalized_ci_overlaps(
 
 
 def _split_by_weight(indices, weights, n_take):
-    """The ``n_take`` most vacancy-local members of ``indices``, and the rest.
-
-    Ties break by ascending orbital index, so the split is reproducible.
-    """
+    """The ``n_take`` most vacancy-local members of ``indices``, and the rest; ties break by
+    index."""
     indices = np.asarray(indices, dtype=int)
     ranked = indices[np.lexsort((indices, -np.asarray(weights)[indices]))]
     return ranked[:n_take], ranked[n_take:]
@@ -420,14 +400,8 @@ def select_vacancy_local_cas(
     weight_floor: float = 0.1,
     allow_degenerate: bool = False,
 ) -> tuple[np.ndarray, dict]:
-    """Order H_act^V so the CAS is the most vacancy-local orbitals.
-
-    Returns a full ``nact`` permutation ``core + cas + virtual``, so the CAS
-    lands in ``[ncore, ncore + ncas)`` where PySCF expects it, plus a
-    diagnostics dict.  The most local orbitals are taken separately within the
-    occupied and the empty manifolds, which fixes the CAS electron count by
-    construction.  ``orbital_energy`` only orders the interiors of the core and
-    virtual blocks and cannot affect the energy.
+    """Order H_act^V core + cas + virtual, the CAS the most vacancy-local orbitals taken
+    separately from the occupied and empty ones.  Returns the permutation and diagnostics.
     """
     weights = np.asarray(weights, dtype=float)
     occupations = np.asarray(occupations, dtype=float)
@@ -446,8 +420,7 @@ def select_vacancy_local_cas(
     if double.size + single.size + empty.size != nact:
         raise RuntimeError("active occupations are not near 0, 1 or 2")
 
-    # Every open shell must sit inside the CAS; outside it an orbital is either
-    # doubly occupied or dropped.
+    # Open shells must lie in the CAS.
     n_cas_single = int(single.size)
     if n_cas_single > ncas:
         raise ValueError(
@@ -523,8 +496,7 @@ def select_vacancy_local_cas(
         "cas_degenerate_cut": False,
     }
 
-    # The gap below is scale free, so only an absolute floor can tell a clean
-    # split from a split through numerical noise.
+    # The gap is scale free; an absolute floor separates a split from noise.
     for name, kept, manifold, occupied in (
         ("occupied", cas_double, double, True),
         ("empty", cas_empty, empty, False),
@@ -581,13 +553,8 @@ def select_energy_frontier_cas(
     gap_tol: float = 1e-4,
     allow_degenerate: bool = False,
 ) -> tuple[np.ndarray, dict]:
-    """Order H_act^V so the CAS is the frontier window in orbital energy.
-
-    The ``ncore`` lowest orbitals are the doubly occupied core and the next
-    ``ncas`` the CAS, which must then hold exactly ``ncas_elec`` electrons with
-    every orbital above it empty.  Returns the same ``core + cas + virtual``
-    permutation and diagnostics as ``select_vacancy_local_cas``.
-    """
+    """Order H_act^V core + cas + virtual, the CAS the energy frontier holding exactly
+    ``ncas_elec`` electrons.  Returns the permutation and diagnostics."""
     occupations = np.asarray(occupations, dtype=float)
     orbital_energy = np.asarray(orbital_energy, dtype=float)
     nact = orbital_energy.size
@@ -752,8 +719,7 @@ def casci_energy(
         matched = overlap[np.arange(order.size), order]
         signs = np.where(matched < 0.0, -1.0, 1.0)
         orbital_min_overlap = float(np.min(np.abs(matched))) if matched.size else 1.0
-        # The CAS window is the subspace the CI vector lives in; guard on that
-        # rather than on the whole active space.
+        # Guard the CAS window, where the CI vector lives, not the whole active space.
         window = np.abs(matched[ncore:ncore + ncas])
         cas_window_min_overlap = float(np.min(window)) if window.size else 1.0
         orbital_subspace_singular_values = match.singular_values.copy()

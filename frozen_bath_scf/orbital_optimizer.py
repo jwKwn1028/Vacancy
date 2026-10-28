@@ -60,18 +60,10 @@ def _conjugate_gradient(hvp, b, precond, rtol, maxiter):
 
 
 def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8, cg_rtol=1e-3, cg_maxiter=300):
-    """Newton steps at fixed occupations until the orbital gradient norm is at most ``tol``.
-
-    Each step is taken in the current orbitals.  It finishes what minimize_orbitals
-    cannot: near a minimum its energy-based line search stops where the energy change,
-    about |g|^2 / H, reaches rounding.  The Newton equations are solved by preconditioned
-    conjugate gradients on Hessian-vector products (so.hessian_vector), with no Hessian
-    matrix.  Before the first step the lowest Hessian eigenvalue is found iteratively
-    (so.lowest_hessian_modes): no step is taken unless it is positive, nor past negative
-    curvature met by CG; a step is halved while it raises the energy.  Returns the
-    rotation, the rotated (h1e, eri) and a record; a record that stops at a
-    non-positive lowest eigenvalue carries its mode as ``lowest_mode`` (an array).
-    """
+    """Newton steps at fixed occupations to an orbital gradient norm of ``tol``, by
+    preconditioned CG on Hessian-vector products.  No step is taken unless the lowest
+    Hessian eigenvalue is positive; a stop there returns its mode as ``lowest_mode``.
+    Returns the rotation, the rotated (h1e, eri) and a record."""
     mask = so.rotation_mask(mo_occ)
     u = np.eye(len(mo_occ))
     g = so.orbital_gradient(h1e, eri, mo_occ)
@@ -124,10 +116,8 @@ def occupation_blocks(mo_occ):
 
 
 def canonical_block_rotation(fock, mo_occ):
-    """Rotation that diagonalizes ``fock`` inside each occupation block.
-    Returns the block-diagonal rotation, the canonical orbital energies in the same
-    orbital positions, and the largest off-diagonal element inside a block before it.
-    """
+    """Rotation diagonalizing ``fock`` within each occupation block, the canonical orbital
+    energies, and the largest off-diagonal element before it."""
     fock = np.asarray(fock)
     n = fock.shape[0]
     rotation = np.zeros((n, n))

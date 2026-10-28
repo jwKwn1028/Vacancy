@@ -1,6 +1,4 @@
-"""The two checkpoints an accepted centre writes, and the solver rebuilt from one.
-
-"""
+"""The two checkpoints an accepted centre writes, and the solver rebuilt from one."""
 from __future__ import annotations
 
 import contextlib
@@ -104,7 +102,7 @@ def write_hact_checkpoint(path, *, meta, solver, result, energy, checkpoint_eri,
 
 def write_hact_input_checkpoint(path, *, meta, solver, checkpoint_eri, scf,
                                 start_rotation=None, start_occ=None) -> None:
-    """Write group ``hact_input``: what the frozen-bath SCF starts from.  Replaces the file."""
+    """Write group ``hact_input``: the frozen-bath SCF's inputs.  Replaces the file."""
     from frozen_bath_scf.frozen_rohf import Frozen_ROHF
 
     is_rohf = isinstance(solver, Frozen_ROHF)
@@ -166,13 +164,8 @@ def load_hact_input(path) -> dict[str, Any]:
 
 
 def solver_from_hact_input(data: dict[str, Any], memory_mb: int = 4000):
-    """The frozen-bath solver of a saved centre, ready for ``kernel``.
-
-    The class is the production one (``SchmidtEmbeddedRHF``/``ROHF``), so the SCF
-    loop, the occupation rule and the defect-orbital tracking are the same code;
-    only ``build`` is skipped, its products being restored from the file.  The
-    supercell is rebuilt for its AO overlap, which the defect-orbital tracking uses.
-    """
+    """The production frozen-bath solver of a saved centre, ready for ``kernel``, with
+    ``build``'s products read from the file."""
     from pyscf.pbc import gto as pbc_gto
     from pyscf.scf import rohf
 

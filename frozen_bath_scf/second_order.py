@@ -67,11 +67,8 @@ def orbital_gradient(h1e, eri, mo_occ, kappa=None):
 
 
 def energy_and_gradient(h1e, eri, mo_occ, kappa):
-    """E(exp(kappa)) and its exact derivative with respect to the antisymmetric kappa.
-
-    dE/dU = 2 (F^a U d^a + F^b U d^b) is carried back through the adjoint of the
-    exponential's Frechet derivative, L(kappa^T, .).
-    """
+    """E(exp(kappa)) and its exact derivative in the antisymmetric kappa, through the
+    exponential's Frechet adjoint."""
     u = _expm_antisym(kappa)
     dm_a, dm_b = densities(mo_occ)
     da, db = u @ dm_a @ u.T, u @ dm_b @ u.T
@@ -88,9 +85,8 @@ def _exact_gradient_vector(h1e, eri, mo_occ, x, mask):
 
 
 def hessian_vector(h1e, eri, mo_occ, v, step=1e-4, mask=None):
-    """The orbital Hessian times ``v``, on the scale of orbital_gradient (half the exact
-    Hessian of E(exp(kappa)) at kappa = 0, as orbital_hessian), by a central difference
-    of the exact gradient along v: two gradient evaluations."""
+    """The orbital Hessian (orbital_hessian's half scale) times ``v``, by a central
+    difference of the exact gradient."""
     mask = rotation_mask(mo_occ) if mask is None else mask
     v = np.asarray(v, dtype=float)
     norm = float(np.linalg.norm(v))
@@ -121,13 +117,9 @@ def hessian_diagonal_estimate(h1e, eri, mo_occ):
 
 def lowest_hessian_modes(h1e, eri, mo_occ, nroots=1, tol=1e-8, max_cycle=200,
                          step=1e-4, dense_below=64):
-    """The ``nroots`` lowest eigenpairs of the orbital Hessian (orbital_hessian's scale).
-
-    Davidson on Hessian-vector products (hessian_vector), about 2 gradient evaluations
-    per product instead of 2 per rotation; with fewer than ``dense_below`` rotations the
-    finite-difference Hessian is built and diagonalized.  Returns (eigenvalues,
-    eigenvectors as columns, converged, number of products).
-    """
+    """The ``nroots`` lowest orbital-Hessian eigenpairs, by Davidson on Hessian-vector
+    products (dense below ``dense_below`` rotations). Returns (values, vectors, converged,
+    products)."""
     from pyscf import lib
 
     mask = rotation_mask(mo_occ)

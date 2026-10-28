@@ -25,6 +25,11 @@ Two steps, each exact:
 The nuclear attraction is assembled the same way: the k-point one unfolded, the moved
 atoms' rows from Gamma integrals over all nuclei (steep unit Gaussians as auxiliary
 functions) plus their seam, and the moved nuclei's change on every other pair.
+
+The explicit parts (rows, seam, moved pairs, moving-auxiliary metric) are built at their
+own precision, 1e-12 by default: the k-point fit is the same at every geometry, but these
+change with it, and screened at the cell's 1e-8 their errors move the energy by up to
+1e-4 Ha/Bohr on hBN.
 """
 import os
 import tempfile
@@ -122,6 +127,14 @@ class RowBuilder(GammaBuilder):
         else:
             s = cell.pbc_intor("int1e_ovlp", hermi=1)
         return np.pi / self.omega ** 2 / cell.vol * chg, s
+
+
+def with_precision(cell, precision):
+    """``cell`` with its screening and lattice sums set by ``precision``."""
+    c = cell.copy()
+    c.precision = float(precision)
+    c.build(False, False)
+    return c
 
 
 def with_atoms(cell, atoms):
@@ -245,7 +258,7 @@ class KpointFit(KpointOutside):
                 start += m
         self.nreal = start
         self._seams = {}
-        self._settings = None
+        self._settings = {}
         self._vnuc = None
 
     def ideal_supercell(self, like):
@@ -257,9 +270,10 @@ class KpointFit(KpointOutside):
         return with_atoms(like, [(like._atom[i][0], coords[i]) for i in range(like.natm)])
 
     def gamma_settings(self, ideal, auxcell):
-        if self._settings is None:
-            self._settings = gamma_settings(ideal, auxcell)
-        return self._settings
+        key = float(ideal.precision)
+        if key not in self._settings:
+            self._settings[key] = gamma_settings(ideal, auxcell)
+        return self._settings[key]
 
     def to_real(self, z):
         out = []
@@ -400,11 +414,12 @@ class KpointFit(KpointOutside):
     def seam_rows(self, atoms, ideal, auxcell, settings, nuclear=False):
         """k-point rows minus Gamma rows at the ideal geometry, per atom: the fit's (real
         basis) and, with ``nuclear``, the nuclear attraction's."""
+        seams = self._seams.setdefault(float(ideal.precision), {})
         missing = [a for a in sorted(atoms)
-                   if a not in self._seams or (nuclear and self._seams[a][1] is None)]
+                   if a not in seams or (nuclear and seams[a][1] is None)]
         if missing:
             for a in missing:
-                self._seams.pop(a, None)
+                seams.pop(a, None)
             rows = np.flatnonzero(fragment_aos(ideal, missing))
             gamma, nuc = fragment_vectors(ideal, auxcell, missing, self, settings, nuclear)
             c = self.to_real(self.unfolded_rows(rows)) - self.to_real(gamma)
@@ -412,10 +427,10 @@ class KpointFit(KpointOutside):
             start = 0
             for a in missing:
                 n = int(np.count_nonzero(fragment_aos(ideal, [a])))
-                self._seams[a] = (c[:, start:start + n],
-                                  None if cn is None else cn[start:start + n])
+                seams[a] = (c[:, start:start + n],
+                            None if cn is None else cn[start:start + n])
                 start += n
-        parts = [self._seams[a] for a in sorted(atoms)]
+        parts = [seams[a] for a in sorted(atoms)]
         c = np.concatenate([x[0] for x in parts], axis=1)
         return c, (np.concatenate([x[1] for x in parts]) if nuclear else None)
 
@@ -433,7 +448,7 @@ class FragmentFit:
     GDF's; the rest delegates to a GDF of ``cell``."""
 
     def __init__(self, kfit, cell, fragment, *, nuclear="kpoint", seam=True, move_aux=True,
-                 column_tol=1e-12, batch=16):
+                 column_tol=1e-12, batch=16, precision=1e-12):
         if nuclear not in ("kpoint", "gamma"):
             raise ValueError("nuclear must be 'kpoint' or 'gamma'")
         if nuclear == "kpoint" and (cell.pseudo or len(cell._ecpbas)):
@@ -443,6 +458,11 @@ class FragmentFit:
         gdf = pbc_df.GDF(cell)
         gdf.auxbasis = kfit.auxbasis
         self.gdf = gdf
+        # The cell the explicit parts are built in; precision None keeps cell's own.
+        self.precision = None if precision is None else float(precision)
+        if self.precision is not None and self.precision != cell.precision:
+            cell = with_precision(cell, self.precision)
+        self.row_cell = cell
         ideal = kfit.ideal_supercell(cell)
         if [cell.atom_symbol(i) for i in range(cell.natm)] != [
                 ideal.atom_symbol(i) for i in range(ideal.natm)]:

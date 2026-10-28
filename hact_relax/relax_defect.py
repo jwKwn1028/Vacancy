@@ -86,6 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "(system/fragment_fit.py), with the k-point nuclear "
                              "attraction; 'gamma' fits the fragment's ERIs with a Gamma "
                              "GDF of the supercell")
+    parser.add_argument("--split-fit-precision", type=float, default=1e-12,
+                        help="the fragment fit's precision for its explicit integrals "
+                             "(the moved atoms' rows, moving auxiliary functions), which "
+                             "change with the geometry; 0 takes the cell's (1e-8)")
     parser.add_argument("--coordsys", default="cart",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
 
@@ -213,6 +217,8 @@ def validate_args(parser: argparse.ArgumentParser, args):
         parser.error("--split is a Gamma reference; drop --reference kmesh")
     if args.split_fit is not None and not args.split:
         parser.error("--split-fit chooses the fit of --split; add --split")
+    if args.split_fit_precision < 0.0:
+        parser.error("--split-fit-precision must not be negative (0 takes the cell's)")
     if args.split and args.split_fit is None:
         args.split_fit = "fragment"
     if args.memory_mb < 1 or args.fd_step <= 0 or args.maxsteps < 1:

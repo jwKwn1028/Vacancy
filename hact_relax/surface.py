@@ -229,6 +229,9 @@ class SurfaceSettings:
     # Thresholds of the ideal crystal's k-point SCF; None takes scf_conv_tol(_grad).
     split_kpoint_conv_tol: float | None = None
     split_kpoint_conv_tol_grad: float | None = None
+    # The fragment fit's precision for the parts that move with the atoms; None takes
+    # the cell's (PySCF's 1e-8), whose screening errors change with the geometry.
+    split_fit_precision: float | None = 1e-12
 
 
 class ActiveHamiltonianSurface:
@@ -359,6 +362,7 @@ class ActiveHamiltonianSurface:
                 gc.collect()
         record.update({
             "split_fit": self.settings.split_fit,
+            "split_fit_precision": self.settings.split_fit_precision,
             "pristine_reference": "split",
             "split_kmesh": list(self.settings.split_kmesh),
             "split_fragment_atoms": list(self.split_atoms),
@@ -628,6 +632,7 @@ class ActiveHamiltonianSurface:
                 chkfile=(self.recorder.pristine_chkfile
                          if accept_center else None),
                 split=split,
+                fit_precision=settings.split_fit_precision,
             )
         record.update({
             "pristine_energy_hartree": float(pristine_kmf.e_tot) * ncells,

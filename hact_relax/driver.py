@@ -391,6 +391,8 @@ def run_one(
         split_atoms, split_lattice, split_kmesh = _primitive_crystal(args, case)
         geometry_fields["split_kmesh"] = list(split_kmesh)
         geometry_fields["split_fit"] = str(getattr(args, "split_fit", None) or "fragment")
+        geometry_fields["split_fit_precision"] = (
+            float(getattr(args, "split_fit_precision", 1e-12)) or None)
         geometry_fields["periodic_scf"] = (
             "Gamma KRHF of the supercell; ERIs with all four AOs outside the "
             "fragment from the ideal crystal's k-point GDF (--split)"
@@ -453,6 +455,7 @@ def run_one(
         split_primitive_atoms=split_atoms,
         split_primitive_lattice_bohr=split_lattice,
         split_fit=str(getattr(args, "split_fit", None) or "fragment"),
+        split_fit_precision=(float(getattr(args, "split_fit_precision", 1e-12)) or None),
     )
     driver_mol = build_driver_molecule(
         labels, coords_bohr, case, args.basis, args.memory_mb, args.verbose

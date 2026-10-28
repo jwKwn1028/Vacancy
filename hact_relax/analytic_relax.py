@@ -5,7 +5,8 @@ problem, and the trapezoid rule between consecutive points,
 
     |E1 - E0 - (g0 + g1).dx/2| <= branch_tol + |(g1 - g0).dx|/4.
 
-Each call writes restart.npz, which Restart continues from.
+Each call writes restart.npz, which Restart continues from.  Each Z-vector starts from the
+previous point's response.
 """
 import json
 import os
@@ -26,14 +27,15 @@ class AnalyticGradientScanner:
 
     branch_tol = 1e-5
     zvector_tol = 1e-10
+    zvector_warm_start = True
     bath_kept_min = 1e-5
     bath_cut_ratio_max = 1e-3
     restart = None
 
     def __init__(self, surface, movable, axes=(0, 1, 2), trajectory=None, **options):
         for name, value in options.items():
-            if name not in ("branch_tol", "zvector_tol", "bath_kept_min",
-                            "bath_cut_ratio_max", "restart"):
+            if name not in ("branch_tol", "zvector_tol", "zvector_warm_start",
+                            "bath_kept_min", "bath_cut_ratio_max", "restart"):
                 raise TypeError("unknown option %r" % name)
             setattr(self, name, value)
         self.surface = surface
@@ -43,6 +45,7 @@ class AnalyticGradientScanner:
         self.calls = 0
         self.last_energy = self.last_gradient = self.last_coords = None
         self.hessian = None
+        self.zvector_density = None
         self.run_dir = (None if trajectory is None
                         else Path(trajectory.xyz_path).parent.resolve())
         self.log_path = (None if self.run_dir is None
@@ -74,6 +77,9 @@ class AnalyticGradientScanner:
         energy, gradient = point.energy, np.zeros_like(coords)
         bath = self._bath_record(point.solver)
         row.update(bath)
+        open_shell = getattr(self.surface, "open_shell_record", None)
+        if open_shell is not None:
+            row.update(open_shell(point.solver, point.active_coeff, point.active_occ))
         problem = self._bath_problem(bath)
         if problem is not None:
             row.update(energy_hartree=energy, guard=problem)
@@ -82,9 +88,11 @@ class AnalyticGradientScanner:
                                           **bath)
         if self.movable:
             t = time.perf_counter()
-            grad = ag.analytic_gradient(point, self.movable, axes=self.axes,
-                                        zvector_tol=self.zvector_tol)
+            grad = ag.analytic_gradient(
+                point, self.movable, axes=self.axes, zvector_tol=self.zvector_tol,
+                zvector_guess=self.zvector_density if self.zvector_warm_start else None)
             row["gradient_seconds"] = time.perf_counter() - t
+            self.zvector_density = grad.zvector_density
             gradient[list(self.movable)] = grad.total
             energy = point.energy + grad.stationarity["energy_change"]
             row.update(stationarity=grad.stationarity, zvector=grad.zvector,
@@ -142,6 +150,8 @@ class AnalyticGradientScanner:
             "pristine_density": np.asarray(pristine.density),
             "pristine_occupied_coeff": np.asarray(pristine.occupied_coeff),
         }
+        if self.zvector_density is not None:
+            data["zvector_density"] = self.zvector_density
         path = self.run_dir / RESTART_FILE
         partial = path.with_name(path.name + ".partial")
         with open(partial, "wb") as f:
@@ -260,6 +270,8 @@ class Restart:
         scanner.last_energy = float(d["energy_hartree"])
         scanner.last_gradient = d["gradient"].copy()
         scanner.hessian = d["hessian"].copy()
+        if "zvector_density" in d:
+            scanner.zvector_density = d["zvector_density"].copy()
         if scanner.run_dir is not None:
             self.hessian_file = scanner.run_dir / "restart_hessian.txt"
             np.savetxt(self.hessian_file, scanner.hessian)

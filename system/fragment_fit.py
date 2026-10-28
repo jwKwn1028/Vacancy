@@ -7,9 +7,12 @@ are then moved by a rank-2|F| correction.  The nuclear attraction is assembled t
 The explicit parts change with the geometry, so they are built at their own precision (1e-12
 by default).
 """
+import contextlib
+import ctypes
 import os
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import h5py
 import numpy as np
@@ -20,6 +23,77 @@ from pyscf.pbc.df import df as pbc_df
 from pyscf.pbc.gto.cell import conc_cell
 
 from system.split_fit import KpointOutside, fragment_aos
+
+# OpenBLAS's thread-count calls, by the names its builds export.
+_OPENBLAS_CALLS = (("openblas_get_num_threads", "openblas_set_num_threads"),
+                   ("openblas_get_num_threads64_", "openblas_set_num_threads64_"),
+                   ("scipy_openblas_get_num_threads64_", "scipy_openblas_set_num_threads64_"))
+
+
+_OPENBLAS = []
+
+
+def _openblas():
+    """(get, set) of the loaded OpenBLAS's thread count, or None."""
+    if _OPENBLAS:
+        return _OPENBLAS[0]
+    _OPENBLAS.append(_find_openblas())
+    return _OPENBLAS[0]
+
+
+def _find_openblas():
+    try:
+        with open("/proc/self/maps") as f:
+            paths = {line.split()[-1] for line in f if "openblas" in line and ".so" in line}
+    except OSError:
+        return None
+    for path in sorted(paths):
+        try:
+            blas = ctypes.CDLL(path)
+        except OSError:
+            continue
+        for get, put in _OPENBLAS_CALLS:
+            if hasattr(blas, get) and hasattr(blas, put):
+                return getattr(blas, get), getattr(blas, put)
+    return None
+
+
+def _one_blas_thread():
+    """OpenBLAS on one thread from this thread: an OpenMP build follows the calling thread's
+    OpenMP count (PySCF shares its runtime), a pthreads build one global count."""
+    lib.num_threads(1)
+    calls = _openblas()
+    if calls is not None:
+        calls[1](1)
+
+
+@contextlib.contextmanager
+def single_threaded_blas():
+    """OpenBLAS on one thread inside; yields False when its calls are not found."""
+    calls = _openblas()
+    if calls is None:
+        yield False
+        return
+    get, put = calls
+    old, omp = int(get()), lib.num_threads()
+    put(1)
+    try:
+        yield True
+    finally:
+        # An OpenMP build sets this thread's OpenMP count with it.
+        put(old)
+        lib.num_threads(omp)
+
+
+def fragment_pairs(fi, cols):
+    """Packed (lower-triangle) indices of the pairs (fi[i], cols[j]), each pair once, with
+    their i and j."""
+    i, j = np.meshgrid(np.arange(len(fi)), np.arange(len(cols)), indexing="ij")
+    a, b = fi[i], cols[j]
+    keep = ~(np.isin(b, fi) & (b > a))
+    i, j, a, b = i[keep], j[keep], a[keep], b[keep]
+    hi, lo = np.maximum(a, b), np.minimum(a, b)
+    return hi * (hi + 1) // 2 + lo, i, j
 
 
 def recording_builder(records):
@@ -179,6 +253,11 @@ def fragment_vectors(cell, auxcell, atoms, kfit, settings, nuclear=False):
     return out, nuc
 
 
+def raw_pairs(cell, auxcell, settings):
+    """Gamma (A|ab) for ``auxcell``, every pair: (naux, npair) packed."""
+    return np.hstack(list(h5_steps(GammaBuilder(cell, auxcell, settings), aosym="s2")))
+
+
 def raw_pair_difference(cell, auxcell, settings):
     """Gamma (A|ab) - (A+n|ab) for the halves of ``auxcell``, every pair: (n, npair) packed."""
     blocks = []
@@ -235,6 +314,12 @@ class KpointFit(KpointOutside):
         self._seams = {}
         self._settings = {}
         self._vnuc = None
+        # Threads for exchange (None: PySCF's count).
+        self.workers = None
+        # Single entries, keyed by the moved atoms: (A|ab) at the ideal positions, and the
+        # moving auxiliary functions' potentials outside the fragment.
+        self.ideal_pairs = None
+        self.outside_potentials = None
 
     def ideal_supercell(self, like):
         """``like`` (a supercell Cell) with every atom at its ideal position."""
@@ -320,24 +405,54 @@ class KpointFit(KpointOutside):
         return t.reshape(mt.shape[:-4] + (nk * n, nk * n)) / nk ** 2
 
     def exchange(self, dt):
-        """K~ of a supercell density in k-space (for _backward),
+        """K~ of a real supercell density in k-space (for _backward),
 
         kt[k1,-k3] = 1/N sum_p,P L^(k1,k1+p)_P D~(k1+p,-k3+p) L^(k3,k3-p)_P^T.
+
+        A real density gives kt[-k1,-k3] = conj(kt[k1,k3]), so half the column blocks are
+        built: per p, in tasks of one column block and a range of rows, over threads that
+        each run BLAS on one thread.
         """
         nk, n = self.nk, self.nao
+        minus, ksum = self.minus, self.ksum
         kt = np.zeros_like(dt)
-        for p in range(nk):
-            a = self.lq[p]
-            naux = a.shape[1]
-            a2 = np.ascontiguousarray(a.transpose(0, 2, 3, 1)).reshape(nk, n, n * naux)
-            b = self.lq[self.minus[p]]
-            rows = self.ksum[:, p]
-            for k3 in range(nk):
-                col = self.minus[self.ksum[k3, self.minus[p]]]
-                d = dt[rows, :, col, :].reshape(nk * n, n)
-                bt = b[k3].transpose(2, 0, 1).reshape(n, naux * n)
-                u = (d @ bt).reshape(nk, n * naux, n)
-                kt[:, :, self.minus[k3], :] += np.matmul(a2, u) / nk
+        half = [k for k in range(nk) if k <= minus[k]]
+        workers = int(self.workers or lib.num_threads())
+        with contextlib.ExitStack() as stack:
+            if workers > 1 and not stack.enter_context(single_threaded_blas()):
+                workers = 1
+            # About four tasks per worker: split the rows when the column blocks are few.
+            nrow = -(-nk // min(nk, -(-4 * workers // len(half))))
+            tasks = [(k3, slice(r, min(r + nrow, nk))) for k3 in half
+                     for r in range(0, nk, nrow)]
+            pool = None
+            if workers > 1:
+                pool = stack.enter_context(
+                    ThreadPoolExecutor(workers, initializer=_one_blas_thread))
+            for p in range(nk):
+                a = self.lq[p]
+                naux = a.shape[1]
+                a2 = np.ascontiguousarray(a.transpose(0, 2, 3, 1)).reshape(nk, n, n * naux)
+                b = self.lq[minus[p]]
+                rows = ksum[:, p]
+
+                def task(job):
+                    k3, r = job
+                    col = minus[ksum[k3, minus[p]]]
+                    d = dt[rows[r], :, col, :].reshape(-1, n)
+                    bt = b[k3].transpose(2, 0, 1).reshape(n, naux * n)
+                    u = (d @ bt).reshape(-1, n * naux, n)
+                    kt[r, :, minus[k3], :] += np.matmul(a2[r], u) / nk
+
+                if pool is None:
+                    for job in tasks:
+                        task(job)
+                else:
+                    list(pool.map(task, tasks))
+        built = {int(minus[k]) for k in half}
+        for c in range(nk):
+            if c not in built:
+                kt[:, :, c, :] = kt[minus, :, minus[c], :].conj()
         return kt
 
     def rows_forward(self, m):
@@ -506,7 +621,11 @@ class FragmentFit:
 
     def _pair_differences(self, cell, ideal, with_aux, with_nuc):
         """(A'|ab) - (A|ab) over every pair, for the moved atoms' auxiliary functions and
-        nuclei."""
+        nuclei.  (A|ab) at the ideal positions changes with the geometry only on the moved
+        atoms' AOs: the k-point fit keeps the rest from the last fit with these moved atoms.
+        """
+        from system.periodic_derivatives import raw_rows
+
         kfit = self.kfit
 
         def half(atoms):
@@ -517,7 +636,18 @@ class FragmentFit:
 
         new = half([cell._atom[i] for i in self.moved])
         old = half([ideal._atom[i] for i in self.moved])
-        diff = raw_pair_difference(cell, conc_cell(new, old), self.settings)
+        key = (tuple(self.moved), float(cell.precision), with_aux, with_nuc)
+        diff = raw_pairs(cell, new, self.settings)
+        if kfit.ideal_pairs is None or kfit.ideal_pairs[0] != key:
+            kfit.ideal_pairs = None
+            pairs = raw_pairs(cell, old, self.settings)
+            diff -= pairs
+            kfit.ideal_pairs = (key, pairs)
+        else:
+            idx, i, j = fragment_pairs(self.fi, np.arange(cell.nao_nr()))
+            moved_pairs = diff[:, idx]
+            diff -= kfit.ideal_pairs[1]
+            diff[:, idx] = moved_pairs - raw_rows(cell, old, self.moved, self.settings)[:, i, j]
         nx = diff.shape[0] - (len(self.moved) if with_nuc else 0)
         return (diff[:nx] if with_aux else None), (diff[nx:] if with_nuc else None)
 
@@ -542,10 +672,22 @@ class FragmentFit:
             self.timings["nuclear"] = time.perf_counter() - t0
         return self.vnuc.copy() if single else self.vnuc[None].copy()
 
-    def dense_potential(self, r, out, add=False):
-        """out[z] (+)= sum_v R_v r[v, z], packed: the fit's vectors combined with coordinates r."""
+    def dense_potential(self, r, out, add=False, outside=None):
+        """out[z] (+)= sum_v R_v r[v, z], packed: the fit's vectors combined with coordinates r.
+        ``outside`` is the part off the fragment's rows, if known (packed)."""
         kfit = self.kfit
         nz = r.shape[1]
+        if outside is not None:
+            idx, i, j = fragment_pairs(self.fi, self.ci)
+            for z0 in range(0, nz, self.batch):
+                z1 = min(z0 + self.batch, nz)
+                v = outside[z0:z1].copy()
+                v[:, idx] = np.tensordot(r[:, z0:z1], self.E, axes=(0, 0))[:, i, j]
+                if add:
+                    out[z0:z1] += v
+                else:
+                    out[z0:z1] = v
+            return out
         for z0 in range(0, nz, self.batch):
             z1 = min(z0 + self.batch, nz)
             mt = kfit.potential([x for x in kfit.to_complex(r[:, z0:z1])])
@@ -582,17 +724,32 @@ class FragmentFit:
         ex[np.arange(nx), xf] = 1.0
         q = np.linalg.qr(kfit.coords(ex))[0]
         a = kfit.aux_coords(xf)
-        k_new = a + kfit.coords(dj)
-        o = k_new - q @ (q.T @ k_new)
+        cdj = kfit.coords(dj)
+        k_new = a + cdj
+        w = q.T @ k_new
+        o = k_new - q @ w
         s_new = a.T @ a + djff - o.T @ o
-        self.dense_potential(a - o, low[:nx], add=True)
+        # T = R q; its part off the fragment's rows depends on the ideal crystal alone.
+        key = (tuple(self.moved), float(cell.precision))
+        cached = kfit.outside_potentials
+        if cached is not None and cached[0] == key:
+            self.dense_potential(q, low[nx:], outside=cached[1])
+        else:
+            kfit.outside_potentials = None
+            self.dense_potential(q, low[nx:])
+            outside = low[nx:].copy()
+            outside[:, fragment_pairs(self.fi, self.ci)[0]] = 0.0
+            kfit.outside_potentials = (key, outside)
+        # a - o = q w - coords(dj), and R is linear.
+        self.dense_potential(-cdj, low[:nx], add=True)
+        for c0 in range(0, low.shape[1], 1 << 20):
+            low[:nx, c0:c0 + (1 << 20)] += w.T @ low[nx:, c0:c0 + (1 << 20)]
         lam, vec = np.linalg.eigh(s_new)
         if lam.min() <= 0:
             raise RuntimeError("moving auxiliary basis: residual metric not positive definite")
         t = (vec / np.sqrt(lam)).T
         for c0 in range(0, low.shape[1], 1 << 20):
             low[:nx, c0:c0 + (1 << 20)] = t @ low[:nx, c0:c0 + (1 << 20)]
-        self.dense_potential(q, low[nx:])
         self.timings["moved_aux_vectors"] = time.perf_counter() - t0
         self.aux_residual_min = float(lam.min())
         self.aux_eig = (lam, vec)

@@ -13,6 +13,7 @@ import scipy.linalg
 from pyscf import lib
 
 from system.iao_pao import partition_ao_labels
+from system.periodic_derivatives import isqrt_divided
 
 
 @dataclass
@@ -401,7 +402,7 @@ def backward(inp, chain, within_bath=False, with_L=False):
     Cpaobar = Clobar[:, niao:]
     rawbar = Cpaobar @ fm
     wm = pao["wm"]
-    Mbar = matfun_adjoint(pao["vm"], divided_differences(wm ** -0.5, wm, -0.5 * wm ** -1.5),
+    Mbar = matfun_adjoint(pao["vm"], isqrt_divided(wm),
                           raw.T @ Cpaobar)
     rawbar += 2 * S @ raw @ Mbar
     Sbar += raw @ Mbar @ raw.T
@@ -413,7 +414,7 @@ def backward(inp, chain, within_bath=False, with_L=False):
     iao = v["iao"]
     A, fa, wa = iao["A"], iao["fa"], iao["wa"]
     Abar = Ciaobar @ fa
-    Mbar = matfun_adjoint(iao["va"], divided_differences(wa ** -0.5, wa, -0.5 * wa ** -1.5),
+    Mbar = matfun_adjoint(iao["va"], isqrt_divided(wa),
                           A.T @ Ciaobar)
     Abar += 2 * S @ A @ Mbar
     Sbar += A @ Mbar @ A.T
@@ -429,7 +430,7 @@ def backward(inp, chain, within_bath=False, with_L=False):
     Sbar += Ct @ Ct.T @ Otbar
     fx, wx = iao["fx"], iao["wx"]
     Xbar = Ctbar @ fx
-    Mbar = matfun_adjoint(iao["vx"], divided_differences(wx ** -0.5, wx, -0.5 * wx ** -1.5),
+    Mbar = matfun_adjoint(iao["vx"], isqrt_divided(wx),
                           X.T @ Ctbar)
     Xbar += 2 * S @ X @ Mbar
     Sbar += X @ Mbar @ X.T
@@ -478,7 +479,9 @@ class Response:
     Cv: np.ndarray
     residual: float = 0.0        # max |A z + b|
     residual_norm: float = 0.0
-    iterations: int = 0          # Krylov iterations, one fit J/K each
+    iterations: int = 0          # fit J/K in the solve (one per Krylov iteration, one more
+                                 # for a guess's residual)
+    guess: bool = False
 
 
 def pristine_g(kmf):
@@ -489,9 +492,10 @@ def pristine_g(kmf):
     return g
 
 
-def zvector(S, fock, Co_chain, Cobar_chain, g, tol=1e-10, max_cycle=100):
-    """The pristine RHF Z-vector, A z = -C_v^T Cobar."""
-    from pyscf.scf import cphf
+def zvector(S, fock, Co_chain, Cobar_chain, g, tol=1e-10, max_cycle=100, guess=None):
+    """The pristine RHF Z-vector, A z = -C_v^T Cobar; ``guess`` is an AO response density
+    to start from (a previous geometry's Pz)."""
+    from pyscf import lib
 
     e, C = scipy.linalg.eigh(fock, S)
     nocc = Co_chain.shape[1]
@@ -514,18 +518,28 @@ def zvector(S, fock, Co_chain, Cobar_chain, g, tol=1e-10, max_cycle=100):
             out.append(2 * Cv.T @ g(p + p.T) @ Co)
         return np.asarray(out)
 
-    occ = np.r_[np.full(nocc, 2.0), np.zeros(nv)]
-    z = cphf.solve(fvind, e, occ, b, tol=tol, max_cycle=max_cycle)[0]
+    # PySCF's cphf.solve (solve_nos1) with a starting point: (1 + e_ai A') z = -e_ai b.
+    e_ai = 1.0 / (e[nocc:, None] - eo[None, :])
+
+    def vind_vo(x):
+        return (fvind(x) * e_ai).reshape(-1, nv * nocc)
+
+    z0 = None
+    if guess is not None and np.shape(guess) == S.shape:
+        z0 = (Cv.T @ S @ guess @ S @ Co).ravel()
+    z = lib.krylov(vind_vo, (-b * e_ai).reshape(1, -1), x0=z0, tol=tol,
+                   max_cycle=max_cycle).reshape(nv, nocc)
     iterations = calls[0]
-    resid = (e[nocc:, None] - eo[None, :]) * z + fvind(z)[0] + b
     p = Cv @ z @ Co.T
     Pz = p + p.T
     gp = g(Pz)
+    resid = (e[nocc:, None] - eo[None, :]) * z + 2 * Cv.T @ gp @ Co + b
     q = Cv @ z @ np.diag(eo) @ Co.T
     oo = Co.T @ Cobar
     W = 0.5 * (q + q.T) + Co @ (Co.T @ gp @ Co) @ Co.T + 0.25 * Co @ (oo + oo.T) @ Co.T
     return Response(z=z, Pz=Pz, W=W, Co=Co, Cv=Cv, residual=float(abs(resid).max()),
-                    residual_norm=float(np.linalg.norm(resid)), iterations=iterations)
+                    residual_norm=float(np.linalg.norm(resid)), iterations=iterations,
+                    guess=z0 is not None)
 
 
 # --------------------------------------------------------------------------- stationarity
@@ -727,17 +741,24 @@ class Gradient:
     stationarity: dict = field(default_factory=dict)
     zvector: dict = field(default_factory=dict)
     multipliers: dict = field(default_factory=dict)
+    zvector_density: np.ndarray = None    # Pz, the next geometry's guess
 
 
 def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None,
-                      zvector_tol=1e-10, keep_multipliers=False):
+                      zvector_tol=1e-10, keep_multipliers=False, fit_derivative="reverse",
+                      zvector_guess=None):
     """dE/dR of ``movable``, which the fit must treat as moved.  ``polish`` makes the active
-    solution stationary first; ``keep_multipliers`` keeps each term's contraction matrices.
+    solution stationary first; ``keep_multipliers`` keeps each term's contraction matrices;
+    ``fit_derivative`` "pm" takes the fit term from two fit J/K per atom and axis instead
+    of the adjoints; ``zvector_guess`` (an earlier Gradient's zvector_density) starts the
+    Z-vector.
     """
     import time
 
     from system import periodic_derivatives as pd
 
+    if fit_derivative not in ("reverse", "pm"):
+        raise ValueError("fit_derivative must be 'reverse' or 'pm'")
     timings = {}
     t0 = time.perf_counter()
     kmf, solver = point.kmf, point.solver
@@ -767,7 +788,8 @@ def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None
     t0 = time.perf_counter()
     g = pristine_g(kmf)
     cobar = adj.Co + 4 * g(v["Y"]) @ inp.Co
-    resp = zvector(inp.S, solver.hcore + solver.vhf, inp.Co, cobar, g, tol=zvector_tol)
+    resp = zvector(inp.S, solver.hcore + solver.vhf, inp.Co, cobar, g, tol=zvector_tol,
+                   guess=zvector_guess)
     timings["zvector"] = time.perf_counter() - t0
 
     ms = 0.5 * (adj.S + adj.S.T) - resp.W
@@ -793,18 +815,25 @@ def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None
     t0 = time.perf_counter()
     der = pd.FitDerivative(fit)
     timings["fit_setup"] = time.perf_counter() - t0
+    adj = der.adjoints(my, v["DP"]) if fit_derivative == "reverse" else None
     fitg = np.zeros((len(atoms), 3))
     nucg = np.zeros((len(atoms), 3))
     timings["fit_integrals"] = timings["nuclear_rows"] = 0.0
     for k, a in enumerate(atoms):
         t = time.perf_counter()
-        ints = der.atom_integrals(a)
+        ints = der.atom_integrals(a, axes)
         timings["fit_integrals"] += time.perf_counter() - t
-        fitg[k] = der.fit_gradient(a, ints, my, v["DP"], axes=axes)
+        fitg[k] = (der.fit_gradient(a, ints, my, v["DP"], axes=axes) if adj is None
+                   else der.reverse_gradient(a, ints, adj, axes=axes))
         t = time.perf_counter()
         nucg[k] = der.nuclear_rows_gradient(a, ints, mh)
         timings["nuclear_rows"] += time.perf_counter() - t
         del ints
+    del adj
+    timings["fit_adjoints"] = der.timings["adjoints"]
+    timings["fit_reverse"] = der.timings["reverse"]
+    for key in ("rows", "to_coords", "aux_pairs", "metric_rows"):
+        timings["fit_" + key] = der.timings[key]
     timings["fit_vectors"] = der.timings["vector_derivatives"]
     timings["fit_pm_jk"] = der.timings["bilinear"]
     timings["fit_and_nuclear_rows"] = time.perf_counter() - t0
@@ -825,7 +854,9 @@ def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None
     return Gradient(total=np.where(mask, total, 0.0), parts=parts, timings=timings,
                     zvector_residual=resp.residual, stationarity=stationarity,
                     zvector={"tol": zvector_tol, "iterations": resp.iterations,
+                             "warm_start": resp.guess,
                              "residual_max": resp.residual,
                              "residual_norm": resp.residual_norm,
+                             "fit_derivative": fit_derivative,
                              "fit_pm_jk_calls": der.timings["bilinear_calls"]},
-                    multipliers=multipliers)
+                    multipliers=multipliers, zvector_density=resp.Pz)

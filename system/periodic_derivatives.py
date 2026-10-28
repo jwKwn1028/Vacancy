@@ -3,6 +3,9 @@
 d/dA_x of x^a y^b z^c exp(-alpha r^2) centred on A is 2 alpha x^(a+1).. - a x^(a-1)..: a
 derivative is the same integral over shells of ang +- 1 ("derivative shells"), recombined.
 """
+import time
+from functools import cached_property
+
 import numpy as np
 from pyscf import gto
 from pyscf.gto.mole import ANG_OF, ATOM_OF, NCTR_OF, NPRIM_OF, PTR_COEFF, PTR_EXP
@@ -270,16 +273,15 @@ class FitDerivative:
         from system.fragment_fit import gamma_metric, with_atoms
 
         self.fit = fit
-        self.timings = {"vector_derivatives": 0.0, "bilinear": 0.0, "bilinear_calls": 0}
+        self.timings = {"vector_derivatives": 0.0, "bilinear": 0.0, "bilinear_calls": 0,
+                        "adjoints": 0.0, "reverse": 0.0, "rows": 0.0, "to_coords": 0.0,
+                        "aux_pairs": 0.0, "metric_rows": 0.0}
         kfit = self.kfit = fit.kfit
         cell = self.cell = getattr(fit, "row_cell", fit.cell)
         ideal = self.ideal = kfit.ideal_supercell(cell)
         self.auxcell = pbc_df.make_auxcell(ideal, kfit.auxbasis)
         self.settings = fit.settings
         moved = self.moved = list(fit.moved)
-        nao = cell.nao_nr()
-        self.Efull = np.zeros((kfit.nreal, len(fit.fi), nao))
-        self.Efull[:, :, fit.ci] = fit.E
         new = [cell._atom[i] for i in moved]
         self.auxnew = pbc_df.make_auxcell(with_atoms(cell, new), kfit.auxbasis)
         if fit.low is None:
@@ -304,35 +306,58 @@ class FitDerivative:
         self.lam, self.vec = fit.aux_eig
         if abs(self.vec @ np.diag(self.lam) @ self.vec.T - s_new).max() > 1e-8 * abs(s_new).max():
             raise RuntimeError("the moving-auxiliary metric differs from the fit's")
-        self.W = self.vec @ (np.sqrt(self.lam)[:, None] * fit.low[:nx])
-        self.U = self.vec @ fit.low[:nx]
         self.T = fit.low[nx:]
+
+    # E with every column, and the low-rank vectors before Lambda^-1/2: the +- path only.
+    @cached_property
+    def Efull(self):
+        fit = self.fit
+        e = np.zeros((self.kfit.nreal, len(fit.fi), self.cell.nao_nr()))
+        e[:, :, fit.ci] = fit.E
+        return e
+
+    @cached_property
+    def W(self):
+        return self.vec @ (np.sqrt(self.lam)[:, None] * self.fit.low[:self.nx])
+
+    @cached_property
+    def U(self):
+        return self.vec @ self.fit.low[:self.nx]
 
     def _new_slice(self, atom):
         k = self.moved.index(atom)
         s = self.auxnew.aoslice_by_atom()[k]
         return k, int(s[2]), int(s[3])
 
-    def atom_integrals(self, atom):
-        """The derivative integrals one atom's motion needs."""
+    def atom_integrals(self, atom, axes=(0, 1, 2)):
+        """The derivative integrals one atom's motion needs; ex and dpairs on ``axes`` only."""
         from pyscf.pbc.df import aft
         from pyscf.pbc.gto.cell import conc_cell
 
-        cell, kfit = self.cell, self.kfit
+        cell, kfit, tm = self.cell, self.kfit, self.timings
         aux = conc_cell(conc_cell(self.auxcell, self.auxnew), aft._fake_nuc(cell, with_pseudo=False))
+        t = time.perf_counter()
         rows = derivative_rows(cell, aux, [atom], self.settings)   # (3, naux_all, nrow, nao)
+        tm["rows"] += time.perf_counter() - t
         nsc = kfit.nk * kfit.naux
         nnew = self.auxnew.nao_nr()
-        ex = np.array([rows_to_coords(kfit, rows[x, :nsc]) for x in range(3)])
+        t = time.perf_counter()
+        ex = {x: rows_to_coords(kfit, rows[x, :nsc]) for x in axes}
+        tm["to_coords"] += time.perf_counter() - t
         vnuc = -np.tensordot(cell.atom_charges(), rows[:, nsc + nnew:], axes=(0, 1))
         if self.nx == 0:
             return dict(ex=ex, vnuc=vnuc)
         dvx = rows[:, nsc:nsc + self.nx] - rows[:, self.xf]
         del rows
         k, p0, p1 = self._new_slice(atom)
+        t = time.perf_counter()
         dpairs = derivative_aux_pairs(cell, self.auxnew, [k], self.settings)
+        dpairs = {x: dpairs[x].copy() for x in axes}
+        tm["aux_pairs"] += time.perf_counter() - t
+        t = time.perf_counter()
         others = conc_cell(self.auxnew, self.auxcell)
         dmet = derivative_metric_rows(cell, self.auxnew, [k], others, self.settings)
+        tm["metric_rows"] += time.perf_counter() - t
         return dict(ex=ex, dvx=dvx, vnuc=vnuc, dpairs=dpairs, dmet=dmet, slice=(p0, p1))
 
     def vector_derivatives(self, atom, ints, x):
@@ -372,7 +397,7 @@ class FitDerivative:
         dw_aux[p0:p1] += ints["dpairs"][x]
         lam, vec = self.lam, self.vec
         inv = (vec / np.sqrt(lam)) @ vec.T
-        ldd = divided(lam ** -0.5, lam, -0.5 * lam ** -1.5)
+        ldd = isqrt_divided(lam)
         dinv = vec @ ((vec.T @ dS @ vec) * ldd) @ vec.T
         dU = dinv @ self.W + inv @ (dw_ao + dw_aux)
         return dE, dU, dt_ao
@@ -394,9 +419,8 @@ class FitDerivative:
         return float(np.vdot(y, j) - 0.5 * np.vdot(y, k))
 
     def fit_gradient(self, atom, ints, y, d, eps=1.0, axes=(0, 1, 2)):
-        """d/dA of Tr[y G[d]], G the fit's J - K/2: exact central difference of a quadratic."""
-        import time
-
+        """d/dA of Tr[y G[d]], G the fit's J - K/2: exact central difference of a quadratic,
+        two fit J/K per axis (the reference for reverse_gradient)."""
         out = np.zeros(3)
         for x in axes:
             t = time.perf_counter()
@@ -413,18 +437,168 @@ class FitDerivative:
             out[x] = (f[0] - f[1]) / (2 * eps)
         return out
 
+    def _contract(self, x):
+        """B_v . x for every real coordinate v (x symmetric)."""
+        fit, kfit = self.fit, self.kfit
+        out = kfit.to_real(kfit.fit(kfit._forward(np.where(fit.oo, x, 0.0))))
+        nf = len(fit.fi)
+        if nf:
+            xfc = x[np.ix_(fit.fi, fit.ci)]
+            out += (2 * np.einsum("vfc,fc->v", fit.E, xfc)
+                    - np.einsum("vfg,fg->v", fit.E[:, :, :nf], xfc[:, :nf]))
+        return out
+
+    def adjoints(self, y, d):
+        """The adjoints of f = Tr[y (J - K/2)[d]] for reverse_gradient, once per (y, d).
+
+        f = sum_v (y.B_v)(d.B_v) - 1/2 Tr(y B_v d B_v) over the fit's vectors and the
+        low-rank ones (with their signs), so df/dB_v = (d.B_v) y + (y.B_v) d
+        - 1/2 (d B_v y + y B_v d).  E holds B_v[f, c] = B_v[c, f]: off the fi x fi block an
+        entry counts twice.  E's adjoint is kept on the fit's columns ci, as the energy keeps
+        the screened ones at zero.  The low-rank adjoint is carried back through
+        vector_derivatives' map to its atom-independent factors.
+        """
+        from pyscf import lib
+
+        t0 = time.perf_counter()
+        fit, kfit = self.fit, self.kfit
+        E, fi, ci = fit.E, fit.fi, fit.ci
+        nf, nao = len(fi), y.shape[0]
+        co = ci[nf:]
+        y = 0.5 * (y + y.T)
+        d = 0.5 * (d + d.T)
+        rd, ry = self._contract(d), self._contract(y)
+
+        def rows(x):
+            r = 2 * x[fi]
+            r[:, fi] *= 0.5
+            return r
+
+        yf, df = rows(y)[:, ci], rows(d)[:, ci]
+        ebar = np.empty((kfit.nreal, nf, len(ci)))
+        # B_v x[:, fi]: the outside block in k-space (as in _k_fragment), then E's rows and
+        # columns.
+        src = []
+        for x in (d, y):
+            m = x[:, fi].copy()
+            m[fi] = 0.0
+            src.append((kfit.rows_forward(m), x[np.ix_(fi, fi)], x[np.ix_(co, fi)]))
+        for p, kind, a, b in kfit.blocks:
+            if kind != "im":
+                yc = [kfit.apply(p, s[0]) for s in src]
+            eb = E[a:b]
+            z = []
+            for c, (_, xff, xof) in zip(yc, src):
+                if kind == "self":
+                    zb = c.real.copy()
+                else:
+                    zb = np.sqrt(2) * (c.real if kind == "re" else c.imag)
+                zb[:, fi] = 0.0
+                zb[:, ci] += np.einsum("vfc,fg->vcg", eb, xff, optimize=True)
+                zb[:, fi] += np.einsum("vfc,cg->vfg", eb[:, :, nf:], xof, optimize=True)
+                z.append(zb)
+            mk = np.matmul(z[0].transpose(0, 2, 1), y) + np.matmul(z[1].transpose(0, 2, 1), d)
+            mk *= -1.0
+            mk[:, :, fi] *= 0.5
+            ebar[a:b] = mk[:, :, ci] + rd[a:b, None, None] * yf + ry[a:b, None, None] * df
+        adj = {"ebar": ebar}
+        if self.nx:
+            nx, low = self.nx, fit.low
+            w, c = np.linalg.eigh(d)
+            keep = np.abs(w) > 1e-14 * max(1.0, np.abs(w).max())
+            c, cw = c[:, keep], c[:, keep] * w[keep]
+            dp = lib.pack_tril(2 * d - np.diag(np.diag(d)))
+            yp = lib.pack_tril(2 * y - np.diag(np.diag(y)))
+            diag = np.arange(nao)
+            lam, vec = self.lam, self.vec
+            # U = vec low[:nx], W = vec Lambda^1/2 low[:nx], inv = r vec^T.
+            r = vec / np.sqrt(lam)
+            ub = np.zeros((nx, low.shape[1]))       # inv Ubar, packed
+            lw = np.empty((nx, nx))                 # df/d(low[:nx]) . low[:nx]
+            rho = np.empty((kfit.nreal, nx))        # B_v . G_x
+            grows = np.empty((2 * nx, nf, nao))     # G_x[fi]
+            for x0 in range(0, 2 * nx, fit.batch):
+                x1 = min(x0 + fit.batch, 2 * nx)
+                lx = lib.unpack_tril(low[x0:x1])
+                h = np.matmul(cw, np.matmul(y, np.matmul(lx, c)).transpose(0, 2, 1))
+                del lx
+                g = ((low[x0:x1] @ dp)[:, None, None] * y + (low[x0:x1] @ yp)[:, None, None] * d
+                     - 0.5 * (h + h.transpose(0, 2, 1)))
+                del h
+                g *= fit.sign[x0:x1, None, None]
+                grows[x0:x1] = g[:, fi]
+                nu = max(0, min(x1, nx) - x0)
+                if nu:
+                    for i in range(nu):
+                        rho[:, x0 + i] = self._contract(g[i])
+                        g[i] *= 2
+                        g[i][diag, diag] *= 0.5
+                    lbar = lib.pack_tril(g[:nu])    # df/d(low[x0:x0+nu]), packed
+                    lw[x0:x0 + nu] = lbar @ low[:nx].T
+                    ub += r[:, x0:x0 + nu] @ lbar
+                    del lbar
+                del g
+            ldd = isqrt_divided(lam)
+            sbar = vec @ (ldd * (lw * np.sqrt(lam))) @ vec.T
+            ssym = sbar + sbar.T
+            dbar = self.o @ ssym + rho @ r.T
+            adj.update(ub=ub, urows=np.tensordot(r, grows[:nx], axes=(1, 0)),
+                       trows=grows[nx:], ssym=ssym, dbar=dbar - self.q @ (self.q.T @ dbar))
+        self.timings["adjoints"] += time.perf_counter() - t0
+        return adj
+
+    def reverse_gradient(self, atom, ints, adj, axes=(0, 1, 2)):
+        """d/dA of Tr[y G[d]] from adjoints(y, d): fit_gradient without the fit J/K."""
+        t0 = time.perf_counter()
+        fit, kfit, nx = self.fit, self.kfit, self.nx
+        fi = fit.fi
+        p0, p1 = (int(i) for i in self.cell.aoslice_by_atom()[atom][2:])
+        s0 = int(np.searchsorted(fi, p0))
+        s1 = s0 + p1 - p0
+        if not np.array_equal(fi[s0:s1], np.arange(p0, p1)):
+            raise ValueError("atom %d is not explicit in the fit" % atom)
+        ebar, ci = adj["ebar"], fit.ci
+        # dE is ex on the atom's rows of E and ex[:, :, fi] on its columns (fi leads ci).
+        ecol = np.ascontiguousarray(ebar[:, :, s0:s1])
+        if nx:
+            # d(low) on the atom's rows: (a - o) and q times ex, mirrored.
+            urows = np.ascontiguousarray(adj["urows"][:, s0:s1])
+            trows = np.ascontiguousarray(adj["trows"][:, s0:s1])
+            c_ao = self.a - self.o
+            q0, q1 = ints["slice"]
+        out = np.zeros(3)
+        for x in axes:
+            ex = ints["ex"][x]
+            g = np.einsum("vrf,vfr->", ex[:, :, fi], ecol, optimize=True)
+            for v0 in range(0, kfit.nreal, 1024):
+                g += np.einsum("vrc,vrc->", ex[v0:v0 + 1024][:, :, ci], ebar[v0:v0 + 1024, s0:s1],
+                               optimize=True)
+            if nx:
+                g += 2 * (np.vdot(np.tensordot(c_ao, ex, axes=(0, 0)), urows)
+                          + np.vdot(np.tensordot(self.q, ex, axes=(0, 0)), trows))
+                dmet = ints["dmet"][x]
+                dj = np.zeros((nx, kfit.nk * kfit.naux))
+                dj[q0:q1] = dmet[:, nx:]
+                g += (2 * np.einsum("yrc,yrc->", ints["dvx"][x], urows, optimize=True)
+                      + np.vdot(adj["ub"][q0:q1], ints["dpairs"][x])
+                      + np.vdot(dmet[:, :nx], adj["ssym"][q0:q1])
+                      - np.vdot(kfit.coords(dj), adj["dbar"]))
+            out[x] = g
+        self.timings["reverse"] += time.perf_counter() - t0
+        return out
+
     def nuclear_rows_gradient(self, atom, ints, m):
         """2 sum_{mu on A, nu} M_munu dV_munu/dA from the AO derivative (all nuclei fixed)."""
         ao = np.flatnonzero(_atom_mask(self.cell, atom))
         return 2 * np.einsum("xmn,mn->x", ints["vnuc"], m[ao])
 
 
-def divided(f_w, w, df_w):
-    dw = w[:, None] - w[None, :]
-    same = np.abs(dw) < 1e-10 * max(1.0, np.abs(w).max())
-    # Degenerate pairs take the limit f'(w), as the diagonal does.
-    return np.where(same, 0.5 * (df_w[:, None] + df_w[None, :]),
-                    (f_w[:, None] - f_w[None, :]) / np.where(same, 1.0, dw))
+def isqrt_divided(w):
+    """Divided differences of w^-1/2, (f_i - f_j)/(w_i - w_j) with f'(w_i) on the diagonal,
+    in closed form.  The moving-auxiliary metric has eigenvalues down to 1e-13 (hBN): there
+    differencing cancels, and a degeneracy threshold merges distinct eigenvalues."""
+    s = np.sqrt(w)
+    return -1.0 / (s[:, None] * s[None, :] * (s[:, None] + s[None, :]))
 
 
 def _atom_mask(cell, atom):

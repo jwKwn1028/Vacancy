@@ -22,7 +22,7 @@ from frozen_bath_scf.schmidt_embedding import (
     SchmidtEmbeddedROHF,
 )
 from system.pristine import build_pristine_mean_field
-from system.shells import nearest_atoms
+from system.shells import coordination_shells, nearest_atoms
 from system.fragment_fit import FragmentFit, KpointFit
 from system.split_fit import KpointOutside
 
@@ -46,6 +46,13 @@ from hact_relax.tracking import (
     transport_active_solution,
     transport_defect_orbital,
 )
+
+
+# Open-shell weights that differ by more than this between equivalent fragment atoms are
+# reported: the frozen-bath state then breaks the defect's symmetry.
+OPEN_SHELL_SPREAD_WARNING = 0.05
+# Distance tolerance (Bohr) for equivalent atoms at the reference geometry.
+EQUIVALENT_ATOM_TOL_BOHR = 1e-3
 
 
 def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=None,
@@ -216,6 +223,8 @@ class SurfaceSettings:
     split_fit_precision: float | None = 1e-12
     # Atoms the fragment fit treats as moved at every geometry.
     split_fit_explicit_atoms: tuple[int, ...] = ()
+    # Worker threads of the fit's k-space exchange; 0 takes PySCF's thread count.
+    split_exchange_workers: int = 0
 
 
 class ActiveHamiltonianSurface:
@@ -249,6 +258,8 @@ class ActiveHamiltonianSurface:
         self.last_energy_terms: dict[str, float] | None = None
         self.measured_noise_floor: float | None = None
         self.ideal_coords_bohr: np.ndarray | None = None
+        # Equivalent fragment atoms are found here when there is no ideal k-mesh crystal.
+        self.population_reference_coords: np.ndarray | None = None
         if settings.primitive_atoms is not None:
             _, self.ideal_coords_bohr = ideal_supercell(
                 settings.primitive_atoms, settings.primitive_lattice_bohr,
@@ -344,6 +355,8 @@ class ActiveHamiltonianSurface:
                     KpointFit(kmf, settings.split_kmesh, records) if fragment_fit
                     else KpointOutside(kmf, settings.split_kmesh)
                 )
+                if fragment_fit:
+                    self.split_outside.workers = settings.split_exchange_workers or None
                 del kmf
                 gc.collect()
         record.update({
@@ -435,6 +448,46 @@ class ActiveHamiltonianSurface:
             ))),
         }
 
+    def _equivalent_fragment_atoms(self, atoms) -> list[list[int]]:
+        """Real fragment atoms of one element at one distance from the vacancy in the
+        ideal crystal (else the first geometry evaluated); groups of two or more."""
+        ref = self.split_ideal_coords
+        if ref is None:
+            ref = self.population_reference_coords
+        atoms = set(atoms) - {self.vacancy_index}
+        groups = []
+        for shell in coordination_shells(ref, self.lattice_bohr, self.vacancy_index,
+                                         EQUIVALENT_ATOM_TOL_BOHR):
+            by_element: dict[str, list[int]] = {}
+            for a in shell:
+                if a in atoms:
+                    by_element.setdefault(ghost_species(self.labels[a]), []).append(a)
+            groups.extend(g for g in by_element.values() if len(g) > 1)
+        return groups
+
+    def open_shell_record(self, solver, coeff, occ) -> dict[str, Any]:
+        """Mulliken weight of the singly occupied active orbitals on each fragment atom,
+        and its largest spread within a group of equivalent atoms."""
+        occ = np.asarray(occ).real
+        single = np.flatnonzero(np.isclose(occ, 1.0))
+        if not single.size:
+            return {}
+        c = np.asarray(coeff).real[:, single]
+        sc = solver.S @ c
+        aoslice = solver.scell.aoslice_by_atom()
+        weights = {}
+        for a in sorted(int(a) for a in solver.frag_atoms):
+            s0, s1 = aoslice[a][2:4]
+            weights[a] = float(np.einsum("ui,ui->", c[s0:s1], sc[s0:s1]))
+        spread, worst = None, []
+        for group in self._equivalent_fragment_atoms(weights):
+            values = [weights[a] for a in group]
+            if spread is None or max(values) - min(values) > spread:
+                spread, worst = max(values) - min(values), group
+        return {"open_shell_population": {str(a): w for a, w in weights.items()},
+                "open_shell_population_spread": spread,
+                "open_shell_population_worst_group": worst}
+
     def _checkpoint_meta(self, coords_bohr, key, evaluation) -> dict[str, Any]:
         return {
             "case": self.settings.case_name,
@@ -510,6 +563,8 @@ class ActiveHamiltonianSurface:
             )
         settings = self.settings
         coords_bohr = np.asarray(coords_bohr, dtype=float).reshape(-1, 3)
+        if self.population_reference_coords is None:
+            self.population_reference_coords = coords_bohr.copy()
         if self.ideal_coords_bohr is not None and not np.allclose(
             coords_bohr, self.ideal_coords_bohr, atol=1e-9, rtol=0.0
         ):
@@ -887,6 +942,16 @@ class ActiveHamiltonianSurface:
                 else int(solver.nelecas)
             ),
         })
+        record.update(self.open_shell_record(solver, result[3], result[4]))
+        spread = record.get("open_shell_population_spread")
+        if spread is not None and spread > OPEN_SHELL_SPREAD_WARNING:
+            print("# warning: %s: the open shell differs between equivalent fragment atoms "
+                  "(%s; spread %.3f): the frozen-bath state breaks the defect's symmetry"
+                  % (reason, ", ".join(
+                      "%s%d %.3f" % (ghost_species(self.labels[a]), a,
+                                     record["open_shell_population"][str(a)])
+                      for a in record["open_shell_population_worst_group"]), spread),
+                  flush=True)
 
         casci = None
         if settings.state != "ground":

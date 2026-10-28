@@ -345,6 +345,7 @@ def run_configuration(
         "semi_analytic_gradient": semi_analytic,
         "analytic_branch_tol_hartree": float(getattr(args, "branch_tol", 1e-5)),
         "analytic_zvector_tol": float(getattr(args, "zvector_tol", 1e-10)),
+        "analytic_zvector_warm_start": bool(getattr(args, "zvector_warm_start", True)),
         "analytic_bath_kept_min": float(getattr(args, "bath_kept_min", 1e-5)),
         "analytic_bath_cut_ratio_max": float(getattr(args, "bath_cut_ratio_max", 1e-3)),
         "analytic_restart_from": (
@@ -403,6 +404,7 @@ def run_one(
         geometry_fields["split_fit"] = str(getattr(args, "split_fit", None) or "fragment")
         geometry_fields["split_fit_precision"] = (
             float(getattr(args, "split_fit_precision", 1e-12)) or None)
+        geometry_fields["split_exchange_workers"] = int(getattr(args, "exchange_workers", 0))
         geometry_fields["periodic_scf"] = (
             "Gamma KRHF of the supercell; ERIs with all four AOs outside the "
             "fragment from the ideal crystal's k-point GDF (--split)"
@@ -468,6 +470,7 @@ def run_one(
         split_fit=str(getattr(args, "split_fit", None) or "fragment"),
         split_fit_precision=(float(getattr(args, "split_fit_precision", 1e-12)) or None),
         split_fit_explicit_atoms=(tuple(int(a) for a in movable) if analytic else ()),
+        split_exchange_workers=int(getattr(args, "exchange_workers", 0)),
     )
     driver_mol = build_driver_molecule(
         labels, coords_bohr, case, args.basis, args.memory_mb, args.verbose
@@ -517,6 +520,7 @@ def run_one(
             trajectory=trajectory,
             branch_tol=float(args.branch_tol),
             zvector_tol=float(args.zvector_tol),
+            zvector_warm_start=bool(args.zvector_warm_start),
             bath_kept_min=float(args.bath_kept_min),
             bath_cut_ratio_max=float(args.bath_cut_ratio_max),
             restart=getattr(args, "restart_state", None),

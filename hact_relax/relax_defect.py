@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-fit-precision", type=float, default=1e-12,
                         help="precision of the fragment fit's moving parts; 0 takes the "
                              "cell's")
+    parser.add_argument("--exchange-workers", type=int, default=0,
+                        help="threads of the fragment fit's k-space exchange, each on "
+                             "one-thread BLAS; 0 takes the run's thread count, 1 runs it "
+                             "on one thread with threaded BLAS")
     parser.add_argument("--coordsys", default="cart",
                         choices=("tric", "cart", "prim", "dlc", "hdlc", "tric-p"))
 
@@ -152,6 +156,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "curvature")
     parser.add_argument("--zvector-tol", type=float, default=1e-10,
                         help="analytic: the pristine Z-vector's Krylov tolerance")
+    parser.add_argument("--zvector-warm-start", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="analytic: start each Z-vector from the previous point's "
+                             "response")
     parser.add_argument("--bath-kept-min", type=float, default=1e-5,
                         help="analytic: smallest kept bath singular value (0: off)")
     parser.add_argument("--bath-cut-ratio-max", type=float, default=1e-3,
@@ -227,6 +235,8 @@ def validate_args(parser: argparse.ArgumentParser, args):
         parser.error("--split-fit chooses the fit of --split; add --split")
     if args.split_fit_precision < 0.0:
         parser.error("--split-fit-precision must not be negative (0 takes the cell's)")
+    if args.exchange_workers < 0:
+        parser.error("--exchange-workers must not be negative (0 takes the thread count)")
     if args.split and args.split_fit is None:
         args.split_fit = "fragment"
     if args.semi_analytic_gradient:

@@ -132,13 +132,15 @@ def gamma_settings(cell, auxcell):
 
 class GammaBuilder(rsdf_builder._RSGDFBuilder):
     """Raw Gamma (A|ab), without the metric.  Keeps room for two one-shell batches, below
-    which PySCF shrinks its G blocks to 16 points."""
+    which PySCF shrinks its G blocks to 16 points, and a quarter of max_memory: PySCF
+    budgets max_memory less what the process holds, down to 1 GB, and a pass in such small
+    pair blocks runs several times slower on many threads."""
 
     def __init__(self, cell, auxcell, settings):
         super().__init__(cell, auxcell, np.zeros((1, 3)))
         self.omega, self.mesh, self.ke_cutoff = settings[0], np.array(settings[1]), settings[2]
         step = int(np.diff(cell.ao_loc_nr()).max()) * cell.nao_nr()
-        room = 2 * step * auxcell.nao_nr() * 64e-6
+        room = max(2 * step * auxcell.nao_nr() * 64e-6, 0.25 * self.max_memory)
         self.max_memory = max(self.max_memory, lib.current_memory()[0] + room)
 
     def gen_uniq_kpts_groups(self, j_only, h5swap, kk_idx=None):

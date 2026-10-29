@@ -594,9 +594,8 @@ class FitDerivative:
 
 
 def isqrt_divided(w):
-    """Divided differences of w^-1/2, (f_i - f_j)/(w_i - w_j) with f'(w_i) on the diagonal,
-    in closed form.  The moving-auxiliary metric has eigenvalues down to 1e-13 (hBN): there
-    differencing cancels, and a degeneracy threshold merges distinct eigenvalues."""
+    """Divided differences of w^-1/2 in closed form: exact for eigenvalues near 1e-13,
+    where differencing cancels and a degeneracy threshold merges them."""
     s = np.sqrt(w)
     return -1.0 / (s[:, None] * s[None, :] * (s[:, None] + s[None, :]))
 

@@ -35,6 +35,12 @@ from hact_relax.errors import (
 )
 from hact_relax.geometry import ghost_species, ideal_supercell, restored_pristine_atoms
 from hact_relax.recording import NullRecorder
+from hact_relax.symmetry import (
+    active_representation,
+    rotation_group,
+    site_rotation,
+    symmetric_frame,
+)
 from hact_relax.tracking import (
     ActiveSolutionReference,
     CASCIReference,
@@ -48,10 +54,8 @@ from hact_relax.tracking import (
 )
 
 
-# Open-shell weights that differ by more than this between equivalent fragment atoms are
-# reported: the frozen-bath state then breaks the defect's symmetry.
+# Open-shell weight spread over equivalent atoms above which a centre warns.
 OPEN_SHELL_SPREAD_WARNING = 0.05
-# Distance tolerance (Bohr) for equivalent atoms at the reference geometry.
 EQUIVALENT_ATOM_TOL_BOHR = 1e-3
 
 
@@ -173,6 +177,35 @@ def follow_negative_mode(result, tol, newton_tol=1e-9):
             info)
 
 
+def symmetric_resolve(result, ops, newton_tol, tol=1e-10):
+    """Re-minimize from a symmetric frame and keep the lower minimum, canonical."""
+    h1e = np.asarray(result[5]).real
+    eri = as_eri(result[6])
+    occ = np.asarray(result[4]).real
+    before = float(energy_at(h1e, eri, occ))
+    frame, report = symmetric_frame(h1e, eri, occ, ops)
+    info = {"symmetric_start_order": len(ops),
+            "symmetric_start_frontier_energies": report["frontier_energies"],
+            "symmetric_start_kept": False}
+    if frame is None:
+        info["symmetric_start_skipped"] = "no symmetric occupation"
+        return result, False, info
+    h, e = rotate_hamiltonian(h1e, eri, frame)
+    u, after, gradient, newton = minimize_and_finish(
+        h, e, occ, np.zeros(int(so.rotation_mask(occ).sum())), newton_tol)
+    info.update({
+        "symmetric_start_energy_change_hartree": float(after - before),
+        "symmetric_start_gradient_norm": gradient,
+        "symmetric_start_saddle_escapes": newton["saddle_escapes"],
+        "symmetric_start_singly_occupied_character": report["singly_occupied_character"],
+    })
+    if not (after < before - abs(tol) and gradient <= newton_tol):
+        return result, False, info
+    info["symmetric_start_kept"] = True
+    return (apply_orbital_rotation(result, None, after, info=info, rotation=frame @ u), True,
+            info)
+
+
 @dataclass
 class SurfaceSettings:
     case_name: str
@@ -193,6 +226,8 @@ class SurfaceSettings:
     follow_mode_tol: float = 1e-8
     rescue_unconverged_scf: bool = True
     rescue_tol_factor: float = 5.0
+    # First centre: also minimize from a symmetric start, keep the lower.
+    symmetric_start: bool = True
     checkpoint_eri: bool = True
     # --state excited: CASCI on H_act^V instead of the frozen-bath SCF energy.
     # Defaults reproduce the sibling repository's own defaults.
@@ -258,7 +293,6 @@ class ActiveHamiltonianSurface:
         self.last_energy_terms: dict[str, float] | None = None
         self.measured_noise_floor: float | None = None
         self.ideal_coords_bohr: np.ndarray | None = None
-        # Equivalent fragment atoms are found here when there is no ideal k-mesh crystal.
         self.population_reference_coords: np.ndarray | None = None
         if settings.primitive_atoms is not None:
             _, self.ideal_coords_bohr = ideal_supercell(
@@ -350,7 +384,11 @@ class ActiveHamiltonianSurface:
                     max_cycle=settings.scf_max_cycle,
                     auxbasis=settings.auxbasis,
                     fit_records=records,
+                    floor_factor=self._floor_factor(),
                 )
+                if kmf.converged_at_floor is not None:
+                    print("# k-point SCF of the ideal crystal accepted at its gradient floor, "
+                          "|g| %.2e" % kmf.converged_at_floor, flush=True)
                 self.split_outside = (
                     KpointFit(kmf, settings.split_kmesh, records) if fragment_fit
                     else KpointOutside(kmf, settings.split_kmesh)
@@ -411,9 +449,33 @@ class ActiveHamiltonianSurface:
         updated[0] = True
         return updated, record
 
+    def _floor_factor(self):
+        """Host SCFs accept a stalled gradient within the rescue factor, if rescuing."""
+        settings = self.settings
+        return settings.rescue_tol_factor if settings.rescue_unconverged_scf else None
+
     def _follow_negative_mode(self, result):
         return follow_negative_mode(result, self.settings.follow_mode_tol,
                                     self.settings.scf_conv_tol_grad)
+
+    def _symmetric_start(self, solver, result):
+        """symmetric_resolve under the rotation about the vacancy, if one exists."""
+        n, rotation = site_rotation(solver.scell, solver.S, self.vacancy_index)
+        if n is None:
+            return result, {"symmetric_start_order": None}
+        w, invariance = active_representation(np.asarray(result[3]).real, solver.S,
+                                              rotation)
+        if invariance < 1.0 - 1e-6:
+            return result, {"symmetric_start_order": n, "symmetric_start_skipped":
+                            "active space not invariant (%.6f)" % invariance}
+        result, kept, info = symmetric_resolve(result, rotation_group(w, n),
+                                               self.settings.scf_conv_tol_grad)
+        info["symmetric_start_active_invariance"] = invariance
+        change = info.get("symmetric_start_energy_change_hartree")
+        print("# symmetric start (C%d about the vacancy): %s" % (
+            n, info.get("symmetric_start_skipped") or "%s, %+.3e Ha from the SCF's solution"
+            % ("kept" if kept else "not lower", change)), flush=True)
+        return result, info
 
     def _embedding_record(self, solver) -> dict[str, Any]:
         singular = np.asarray(
@@ -449,8 +511,8 @@ class ActiveHamiltonianSurface:
         }
 
     def _equivalent_fragment_atoms(self, atoms) -> list[list[int]]:
-        """Real fragment atoms of one element at one distance from the vacancy in the
-        ideal crystal (else the first geometry evaluated); groups of two or more."""
+        """Fragment atoms grouped by element and distance from the vacancy (ideal crystal,
+        else the first geometry); groups of two or more."""
         ref = self.split_ideal_coords
         if ref is None:
             ref = self.population_reference_coords
@@ -466,8 +528,8 @@ class ActiveHamiltonianSurface:
         return groups
 
     def open_shell_record(self, solver, coeff, occ) -> dict[str, Any]:
-        """Mulliken weight of the singly occupied active orbitals on each fragment atom,
-        and its largest spread within a group of equivalent atoms."""
+        """Open-shell Mulliken weight per fragment atom, and its largest spread over
+        equivalent atoms."""
         occ = np.asarray(occ).real
         single = np.flatnonzero(np.isclose(occ, 1.0))
         if not single.size:
@@ -676,7 +738,12 @@ class ActiveHamiltonianSurface:
                 split=split,
                 fit_precision=settings.split_fit_precision,
                 fit_explicit=settings.split_fit_explicit_atoms,
+                floor_factor=self._floor_factor(),
             )
+        floor = getattr(pristine_kmf, "converged_at_floor", None)
+        if floor is not None:
+            print("# %s: host SCF accepted at its gradient floor, |g| %.2e (threshold %.0e)"
+                  % (reason, floor, settings.scf_conv_tol_grad), flush=True)
         record.update({
             "pristine_energy_hartree": float(pristine_kmf.e_tot) * ncells,
             "pristine_energy_per_cell_hartree": float(pristine_kmf.e_tot),
@@ -684,6 +751,7 @@ class ActiveHamiltonianSurface:
             "pristine_scf_cycles": pristine_scf["cycles"],
             "pristine_scf_final_delta_energy_hartree": pristine_scf["delta"],
             "pristine_scf_final_orbital_gradient_norm": pristine_scf["gradient"],
+            "pristine_scf_floor_accepted": floor,
             "pristine_guess_from_previous_center": prior_pristine is not None,
         })
         fit = pristine_kmf.with_df
@@ -881,6 +949,12 @@ class ActiveHamiltonianSurface:
                     record.update(mode)
                     if accept_center:
                         self.last_center_followed = bool(followed)
+
+                # First centre only; later ones follow its solution.
+                if (result[0] and accept_center and settings.symmetric_start
+                        and self.active_solution_reference is None):
+                    result, symmetric = self._symmetric_start(solver, result)
+                    record.update(symmetric)
         else:
             if start_rotation is None or start_occ is None:
                 raise RuntimeError(

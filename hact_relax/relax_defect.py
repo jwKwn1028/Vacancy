@@ -105,6 +105,10 @@ def build_parser() -> argparse.ArgumentParser:
                         default=True,
                         help="follow a negative orbital-Hessian mode both ways to the "
                              "lower minimum (default on)")
+    parser.add_argument("--symmetric-start", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="re-solve the first centre from a symmetric start, keep the "
+                             "lower (default on)")
     parser.add_argument("--min-subspace-overlap", type=float, default=None,
                         help="co-moving active-space overlap below which a displaced "
                              "point stops and a centre restarts its SCF (default 0.5; 0 "

@@ -508,10 +508,12 @@ class _SchmidtEmbedding:
         if self.keep_cluster_df:
             self.cluster_df = dfobj
         nao = mol.nao_nr()
+        # About 1 GB per unpacked block: PySCF's default 240 is 10 GB at hBN 9x9.
+        blksize = max(1, int(1e9 / (8.0 * nao * nao)))
         Lij_chunks = []
-        for Lpq in dfobj.loop():
+        for Lpq in dfobj.loop(blksize):
             Lpq = lib.unpack_tril(np.asarray(Lpq)).reshape(-1, nao, nao)
-            Lij_chunks.append(lib.einsum("Lpq,pi,qj->Lij", Lpq, Cact, Cact))
+            Lij_chunks.append(np.matmul(Cact.T, np.matmul(Lpq, Cact)))
         return DFEri(np.concatenate(Lij_chunks, axis=0).real)
 
     def _nuc_ao_integral_for_atom(self, symmetric=True):

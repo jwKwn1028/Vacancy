@@ -33,6 +33,33 @@ def _install_pristine_hcore_capture(kmf):
     kmf.post_kernel = capture_hcore
 
 
+def plateau_convergence(conv_tol, conv_tol_grad, factor, cycles=3):
+    """PySCF check_convergence: the usual test, or a gradient stalled within ``factor`` of
+    ``conv_tol_grad`` after ``cycles`` cycles of converged energy (a numerical floor, e.g.
+    hBN 9x9's Gamma host).  ``check.floor`` is the gradient accepted that way."""
+    history = []
+
+    def check(envs):
+        de, g = abs(envs["e_tot"] - envs["last_hf_e"]), float(envs["norm_gorb"])
+        tol, gtol = envs["conv_tol"], envs["conv_tol_grad"]
+        if envs["mf"].cycles:
+            # The extra cycle after convergence: PySCF's own looser test.
+            return de < tol or g < gtol
+        if de < tol and g < gtol:
+            return True
+        history.append((de, g))
+        window = history[-cycles:]
+        if (len(window) == cycles and all(d < conv_tol for d, _ in window)
+                and all(x < factor * conv_tol_grad for _, x in window)
+                and window[-1][1] > 0.9 * window[0][1]):
+            check.floor = g
+            return True
+        return False
+
+    check.floor = None
+    return check
+
+
 def build_pristine_mean_field(
     atoms,
     lattice,
@@ -56,10 +83,13 @@ def build_pristine_mean_field(
     fit_records=None,
     fit_precision=1e-12,
     fit_explicit=(),
+    floor_factor=None,
 ):
     """The pristine KRHF. ``split`` = (outside, atoms) replaces the Gamma GDF: a
     KpointOutside gives the split fit, a KpointFit the fragment fit (``fit_precision``,
-    ``fit_explicit``). ``fit_records`` collects the GDF's metric factors for a KpointFit."""
+    ``fit_explicit``). ``fit_records`` collects the GDF's metric factors for a KpointFit.
+    ``floor_factor`` accepts a stalled gradient (plateau_convergence); the gradient
+    accepted that way is ``kmf.converged_at_floor``."""
     from pyscf.pbc import gto, scf
 
     cell = gto.Cell()
@@ -92,6 +122,9 @@ def build_pristine_mean_field(
     kmf.conv_tol_grad = float(conv_tol_grad)
     kmf.max_cycle = int(max_cycle)
     kmf.max_memory = int(max_memory)
+    if floor_factor:
+        kmf.check_convergence = plateau_convergence(kmf.conv_tol, kmf.conv_tol_grad,
+                                                    float(floor_factor))
 
     if dm0 is not None:
         dm0 = np.asarray(dm0)
@@ -116,6 +149,7 @@ def build_pristine_mean_field(
 
         with lib.temporary_env(pbc_df, _RSGDFBuilder=recording_builder(fit_records)):
             kmf.kernel(dm0=dm0)
+    kmf.converged_at_floor = getattr(kmf.check_convergence, "floor", None)
     if not kmf.converged:
         raise RuntimeError("pristine KRHF did not converge")
     if chkfile is not None:

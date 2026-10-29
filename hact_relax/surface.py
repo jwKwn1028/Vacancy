@@ -197,6 +197,8 @@ def symmetric_resolve(result, ops, newton_tol, tol=1e-10):
         "symmetric_start_energy_change_hartree": float(after - before),
         "symmetric_start_gradient_norm": gradient,
         "symmetric_start_saddle_escapes": newton["saddle_escapes"],
+        # From a symmetric saddle the two ends are mirror images: their gap is the splitting.
+        "symmetric_start_branch_gap_hartree": newton.get("saddle_branch_gap_hartree"),
         "symmetric_start_singly_occupied_character": report["singly_occupied_character"],
     })
     if not (after < before - abs(tol) and gradient <= newton_tol):

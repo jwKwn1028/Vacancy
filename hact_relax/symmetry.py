@@ -75,15 +75,16 @@ def rotation_group(w, n):
 
 
 def _fill(sizes, scores, count, taken):
-    """Whole sets, highest score first, adding up to ``count``; None if none do."""
-    chosen, left = [], count
+    """Whole sets adding up to ``count`` with the most occupation (knapsack); None if none
+    do."""
+    best = {0: (0.0, [])}
     for k in sorted(set(range(len(sizes))) - taken, key=lambda k: -scores[k]):
-        if left == 0:
-            break
-        if sizes[k] <= left:
-            chosen.append(k)
-            left -= sizes[k]
-    return chosen if left == 0 else None
+        for c, (value, chosen) in sorted(best.items(), reverse=True):
+            n = c + sizes[k]
+            gain = value + scores[k] * sizes[k]
+            if n <= count and (n not in best or gain > best[n][0] + 1e-12):
+                best[n] = (gain, chosen + [k])
+    return best[count][1] if count in best else None
 
 
 def symmetric_frame(h1e, eri, occ, ops, tol=1e-6):
@@ -130,3 +131,82 @@ def symmetric_frame(h1e, eri, occ, ops, tol=1e-6):
     report["singly_occupied_character"] = (float(np.trace(vs.T @ ops[1] @ vs))
                                            if len(ops) > 1 and ns else None)
     return frame, report
+
+
+# Candidate point operations of a hexagonal sheet or an x chain: z rotations by 30 degrees,
+# with or without a vertical and the horizontal mirror.
+def _candidate_matrices():
+    out = []
+    for k in range(12):
+        c, s = np.cos(k * np.pi / 6), np.sin(k * np.pi / 6)
+        rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        for vertical in (np.eye(3), np.diag([1.0, -1.0, 1.0])):
+            for horizontal in (np.eye(3), np.diag([1.0, 1.0, -1.0])):
+                out.append(rot @ vertical @ horizontal)
+    return out
+
+
+class SiteGroup:
+    """Point operations x -> c + Q (x - c) about atom ``center`` mapping ``coords`` onto
+    itself, as (Q, perm), perm[a] the image of atom a."""
+
+    def __init__(self, coords, lattice, labels, center, tol=1e-6):
+        self.coords = np.asarray(coords, dtype=float)
+        self.lattice = np.asarray(lattice, dtype=float)
+        self.center = int(center)
+        self.tol = float(tol)
+        labels = [str(x) for x in labels]
+        self.ops = []
+        for q in _candidate_matrices():
+            perm = self._permutation(self.coords, q, labels)
+            if perm is not None and not any(np.allclose(q, p) for p, _ in self.ops):
+                self.ops.append((q, perm))
+        self.inverse = [np.argsort(perm) for _, perm in self.ops]
+
+    def _wrap(self, d):
+        frac = d @ np.linalg.inv(self.lattice)
+        return (frac - np.round(frac)) @ self.lattice
+
+    def _permutation(self, coords, q, labels):
+        c = coords[self.center]
+        images = c + (coords - c) @ q.T
+        perm = np.empty(len(coords), dtype=int)
+        for a, r in enumerate(images):
+            dist = np.linalg.norm(self._wrap(coords - r), axis=1)
+            b = int(np.argmin(dist))
+            if dist[b] > self.tol or labels[b] != labels[a]:
+                return None
+            perm[a] = b
+        return perm if len(set(perm.tolist())) == len(perm) else None
+
+    @property
+    def order(self):
+        return len(self.ops)
+
+    def field(self, u):
+        """The group average of a displacement or gradient field (natm, 3)."""
+        u = np.asarray(u, dtype=float)
+        out = np.zeros_like(u)
+        for q, perm in self.ops:
+            out[perm] += u @ q.T
+        return out / self.order
+
+    def geometry(self, coords):
+        """``coords`` averaged over the group."""
+        x = np.asarray(coords, dtype=float)
+        c = x[self.center]
+        shift = np.zeros_like(x)
+        for (q, _), inv in zip(self.ops, self.inverse):
+            shift += self._wrap(c + (x[inv] - c) @ q.T - x)
+        return x + shift / self.order
+
+    def check_subspace(self, movable, axes):
+        """Refuse movable atoms or axes the group does not map onto themselves."""
+        allowed = np.zeros(self.coords.shape, dtype=bool)
+        allowed[np.ix_(list(movable), list(axes))] = True
+        for q, perm in self.ops:
+            moved = np.zeros_like(allowed)
+            moved[perm] = (allowed.astype(float) @ np.abs(q).T) > 1e-12
+            if (moved & ~allowed).any():
+                raise ValueError("the site group does not map the movable atoms %s on axes "
+                                 "%s onto themselves" % (list(movable), list(axes)))

@@ -15,30 +15,35 @@ def energy_at(h1e, eri, mo_occ, kappa=None):
     return so.energy_from_dm(h1e, dm_a, dm_b, eri)
 
 
-def minimize_orbitals(h1e, eri, mo_occ, x0, maxiter=2000, gtol=1e-9):
+def minimize_orbitals(h1e, eri, mo_occ, x0, maxiter=2000, gtol=1e-9, project=None):
+    """L-BFGS on the rotation vector, within the range of ``project`` if given."""
     mask = so.rotation_mask(mo_occ)
+    keep = (lambda x: x) if project is None else project
 
     def fun(x):
-        energy, g = energy_and_gradient(h1e, eri, mo_occ, so._kappa_from_vector(x, mask))
-        return energy, g[mask] - g.T[mask]
+        energy, g = energy_and_gradient(h1e, eri, mo_occ,
+                                        so._kappa_from_vector(keep(x), mask))
+        return energy, keep(g[mask] - g.T[mask])
 
     result = minimize(
-        fun, np.asarray(x0, dtype=float), jac=True, method="L-BFGS-B",
+        fun, keep(np.asarray(x0, dtype=float)), jac=True, method="L-BFGS-B",
         options={"maxiter": maxiter, "ftol": 0.0, "gtol": gtol},
     )
-    return result, so._kappa_from_vector(result.x, mask)
+    return result, so._kappa_from_vector(keep(result.x), mask)
 
 
 def rotate_hamiltonian(h1e, eri, u):
     return u.T @ h1e @ u, rotate_eri(eri, u)
 
 
-def _conjugate_gradient(hvp, b, precond, rtol, maxiter):
-    """Preconditioned CG for H x = b.  Stops at negative curvature (returns the iterate
-    so far and False).  Returns (x, positive, products)."""
+def _conjugate_gradient(hvp, b, precond, rtol, maxiter, keep=None):
+    """Preconditioned CG for H x = b, the residual kept in a subspace by ``keep``.  Stops at
+    negative curvature (returns the iterate so far and False).  Returns (x, positive,
+    products)."""
+    keep = (lambda x: x) if keep is None else keep
     x = np.zeros_like(b)
     r = b.copy()
-    z = precond * r
+    z = keep(precond * r)
     p = z.copy()
     rz = float(r @ z)
     target = rtol * float(np.linalg.norm(b))
@@ -52,21 +57,24 @@ def _conjugate_gradient(hvp, b, precond, rtol, maxiter):
         r = r - alpha * hp
         if np.linalg.norm(r) <= target:
             return x, True, it + 1
-        z = precond * r
+        z = keep(precond * r)
         rz_new = float(r @ z)
         p = z + (rz_new / rz) * p
         rz = rz_new
     return x, True, maxiter
 
 
-def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8, cg_rtol=1e-3, cg_maxiter=300):
+def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8, cg_rtol=1e-3, cg_maxiter=300,
+                  project=None):
     """Newton steps at fixed occupations to an orbital gradient norm of ``tol``, by
     preconditioned CG on Hessian-vector products.  No step is taken unless the lowest
     Hessian eigenvalue is positive; a stop there returns its mode as ``lowest_mode``.
-    Returns the rotation, the rotated (h1e, eri) and a record."""
+    ``project`` (symmetry_projector) keeps every step in its range.  Returns the rotation,
+    the rotated (h1e, eri) and a record."""
     mask = so.rotation_mask(mo_occ)
+    keep = (lambda x: x) if project is None else project
     u = np.eye(len(mo_occ))
-    g = so.orbital_gradient(h1e, eri, mo_occ)
+    g = keep(so.orbital_gradient(h1e, eri, mo_occ))
     e = energy_at(h1e, eri, mo_occ)
     info = {"newton_cycles": 0, "newton_gradient_before": float(np.linalg.norm(g)),
             "newton_stop": "converged", "newton_hessian_vector_products": 0}
@@ -75,7 +83,8 @@ def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8, cg_rtol=1e-3, cg_maxiter=3
             info["newton_stop"] = "max_cycle"
             break
         if info["newton_cycles"] == 0:
-            lowest, modes, _, products = so.lowest_hessian_modes(h1e, eri, mo_occ)
+            lowest, modes, _, products = so.lowest_hessian_modes(h1e, eri, mo_occ,
+                                                                 project=project)
             info["newton_lowest_hessian"] = float(lowest[0])
             info["newton_hessian_vector_products"] += products
             if lowest[0] <= 0.0:
@@ -85,8 +94,8 @@ def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8, cg_rtol=1e-3, cg_maxiter=3
         diag = np.abs(so.hessian_diagonal_estimate(h1e, eri, mo_occ))
         precond = 1.0 / np.maximum(diag, 1e-3 * max(1.0, diag.max()))
         x, positive, products = _conjugate_gradient(
-            lambda v: so.hessian_vector(h1e, eri, mo_occ, v, mask=mask), -g, precond,
-            cg_rtol, cg_maxiter)
+            lambda v: keep(so.hessian_vector(h1e, eri, mo_occ, keep(v), mask=mask)), -g,
+            precond, cg_rtol, cg_maxiter, keep)
         info["newton_hessian_vector_products"] += products
         if not positive:
             info["newton_stop"] = "hessian_not_positive"
@@ -103,7 +112,7 @@ def newton_finish(h1e, eri, mo_occ, tol, max_cycle=8, cg_rtol=1e-3, cg_maxiter=3
             break
         h1e, eri, e = h_new, eri_new, e_new
         u = u @ step
-        g = so.orbital_gradient(h1e, eri, mo_occ)
+        g = keep(so.orbital_gradient(h1e, eri, mo_occ))
         info["newton_cycles"] += 1
     info["newton_gradient_after"] = float(np.linalg.norm(g))
     return u, h1e, eri, info

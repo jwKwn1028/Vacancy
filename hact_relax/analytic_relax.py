@@ -6,7 +6,8 @@ problem, and the trapezoid rule between consecutive points,
     |E1 - E0 - (g0 + g1).dx/2| <= branch_tol + |(g1 - g0).dx|/4.
 
 Each call writes restart.npz, which Restart continues from.  Each Z-vector starts from the
-previous point's response.
+previous point's response.  A site group (``symmetry``) averages each geometry and projects
+each gradient, so geomeTRIC's steps keep the symmetry.
 """
 import json
 import os
@@ -20,6 +21,7 @@ from hact_relax.errors import BranchFlip, SubspaceContinuityError
 
 STATIONARITY_LIMIT = 1e-6
 RESTART_FILE = "restart.npz"
+SYMMETRY_SHIFT_LIMIT_BOHR = 1e-6
 
 
 class AnalyticGradientScanner:
@@ -31,11 +33,12 @@ class AnalyticGradientScanner:
     bath_kept_min = 1e-5
     bath_cut_ratio_max = 1e-3
     restart = None
+    symmetry = None
 
     def __init__(self, surface, movable, axes=(0, 1, 2), trajectory=None, **options):
         for name, value in options.items():
             if name not in ("branch_tol", "zvector_tol", "zvector_warm_start",
-                            "bath_kept_min", "bath_cut_ratio_max", "restart"):
+                            "bath_kept_min", "bath_cut_ratio_max", "restart", "symmetry"):
                 raise TypeError("unknown option %r" % name)
             setattr(self, name, value)
         self.surface = surface
@@ -50,13 +53,42 @@ class AnalyticGradientScanner:
                         else Path(trajectory.xyz_path).parent.resolve())
         self.log_path = (None if self.run_dir is None
                          else self.run_dir / "analytic_gradient.jsonl")
+        if self.symmetry is not None:
+            self.symmetry.check_subspace(self.movable, self.axes)
         if self.restart is not None:
             self.restart.apply(self)
+            if self.symmetry is not None:
+                self._symmetrize_restart()
+
+    def _symmetrize_restart(self):
+        """Project a restart's gradient and Hessian (0.5 off the invariant displacements)."""
+        shape = self.last_gradient.shape
+        self.last_gradient = self.symmetry.field(self.last_gradient)
+        p = np.array([self.symmetry.field(e.reshape(shape)).ravel()
+                      for e in np.eye(self.last_gradient.size)])
+        self.hessian = p @ self.hessian @ p + 0.5 * (np.eye(len(p)) - p)
+        if self.restart.hessian_file is not None:
+            np.savetxt(self.restart.hessian_file, self.hessian)
+
+    def _symmetric_coords(self, coords, row):
+        snapped = self.symmetry.geometry(coords)
+        shift = float(np.abs(snapped - coords).max())
+        row["symmetry_geometry_shift_bohr"] = shift
+        if shift > SYMMETRY_SHIFT_LIMIT_BOHR:
+            self._log(row)
+            raise ValueError(
+                "the geometry breaks the site group (order %d) by up to %.2e Bohr: a "
+                "symmetry-constrained relaxation starts from a symmetric geometry, and its "
+                "steps keep it" % (self.symmetry.order, shift))
+        return snapped
 
     def __call__(self, mol):
         self.calls += 1
         coords = np.asarray(mol.atom_coords(), dtype=float)
         row = {"call": self.calls}
+        # Evaluated at the group average; geomeTRIC's coordinates are kept for comparisons.
+        evaluated = (coords if self.symmetry is None
+                     else self._symmetric_coords(coords, row))
         if (self.calls == 1 and self.restart is not None
                 and np.allclose(coords, self.last_coords, atol=1e-8, rtol=0.0)):
             row.update(restored_from=os.fspath(self.restart.path),
@@ -70,7 +102,7 @@ class AnalyticGradientScanner:
             self._save_restart()
             return self.last_energy, self.last_gradient.copy()
         t = time.perf_counter()
-        point = ag.capture_point(self.surface, coords,
+        point = ag.capture_point(self.surface, evaluated,
                                  "analytic-gradient-%d-center" % self.calls)
         row["energy_seconds"] = time.perf_counter() - t
         row["production_energy_hartree"] = point.energy
@@ -94,6 +126,9 @@ class AnalyticGradientScanner:
             row["gradient_seconds"] = time.perf_counter() - t
             self.zvector_density = grad.zvector_density
             gradient[list(self.movable)] = grad.total
+            if self.symmetry is not None:
+                full, gradient = gradient, self.symmetry.field(gradient)
+                row["gradient_asymmetric_max"] = float(abs(full - gradient).max())
             energy = point.energy + grad.stationarity["energy_change"]
             row.update(stationarity=grad.stationarity, zvector=grad.zvector,
                        timings=grad.timings)
@@ -140,6 +175,7 @@ class AnalyticGradientScanner:
             "coords_bohr": self.last_coords, "energy_hartree": self.last_energy,
             "gradient": self.last_gradient, "hessian": self.hessian,
             "movable": np.asarray(self.movable), "axes": np.asarray(self.axes),
+            "symmetry_constrained": self.symmetry is not None,
             "fixed_n_bath": int(surface.fixed_n_bath),
             "fixed_fragment_atoms": np.asarray(surface.fixed_fragment_atoms, dtype=int),
             "active_cell": active.cell.dumps(),

@@ -109,6 +109,10 @@ def build_parser() -> argparse.ArgumentParser:
                         default=True,
                         help="re-solve the first centre from a symmetric start, keep the "
                              "lower (default on)")
+    parser.add_argument("--constrain-symmetry", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="analytic: keep the SCF and geometry symmetric about the "
+                             "vacancy (default off)")
     parser.add_argument("--min-subspace-overlap", type=float, default=None,
                         help="co-moving active-space overlap below which a displaced "
                              "point stops and a centre restarts its SCF (default 0.5; 0 "
@@ -255,6 +259,9 @@ def validate_args(parser: argparse.ArgumentParser, args):
         parser.error("--gradient analytic needs --split with the fragment fit and "
                      "--state ground")
     args.semi_analytic_gradient = args.gradient == "semi-analytic"
+    if args.constrain_symmetry and args.gradient != "analytic":
+        parser.error("--constrain-symmetry needs the analytic gradient: finite-difference "
+                     "points are not symmetric")
     if args.min_subspace_overlap is None:
         args.min_subspace_overlap = 0.0 if args.gradient == "analytic" else 0.5
     if args.branch_tol <= 0.0 or args.zvector_tol <= 0.0:

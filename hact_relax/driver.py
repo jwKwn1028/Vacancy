@@ -52,6 +52,7 @@ from hact_relax.gradient import (
 )
 from hact_relax.recording import RunRecorder
 from hact_relax.surface import ActiveHamiltonianSurface, SurfaceSettings
+from hact_relax.symmetry import SiteGroup
 
 
 @contextlib.contextmanager
@@ -334,6 +335,7 @@ def run_configuration(
         "rescue_tol_factor": float(args.rescue_tol_factor),
         "follow_negative_mode": bool(args.follow_negative_mode),
         "symmetric_start": bool(args.symmetric_start),
+        "constrain_symmetry": bool(getattr(args, "constrain_symmetry", False)),
         "follow_mode_tol": 1e-8,
         "min_subspace_overlap": float(args.min_subspace_overlap),
         "min_center_subspace_overlap": float(args.min_center_subspace_overlap),
@@ -442,6 +444,7 @@ def run_one(
         verbose=args.verbose,
         follow_negative_mode=bool(args.follow_negative_mode),
         symmetric_start=bool(args.symmetric_start),
+        constrain_symmetry=bool(getattr(args, "constrain_symmetry", False)),
         rescue_unconverged_scf=bool(args.rescue_unconverged_scf),
         rescue_tol_factor=float(args.rescue_tol_factor),
         checkpoint_eri=not bool(getattr(args, "no_eri_checkpoint", False)),
@@ -514,6 +517,13 @@ def run_one(
     )
     # --energy-only: no movable atoms, so one call evaluates the centre and the outputs
     # are written as usual.
+    site_group = None
+    if settings.constrain_symmetry:
+        # The ideal crystal's group, so a distorted start is refused.
+        site_group = SiteGroup(surface.split_ideal_coords, lattice_bohr, labels,
+                               vacancy_index)
+        print("# --constrain-symmetry: the vacancy site's point group has order %d"
+              % site_group.order, flush=True)
     if analytic:
         scanner = AnalyticGradientScanner(
             surface,
@@ -526,6 +536,7 @@ def run_one(
             bath_kept_min=float(args.bath_kept_min),
             bath_cut_ratio_max=float(args.bath_cut_ratio_max),
             restart=getattr(args, "restart_state", None),
+            symmetry=site_group,
         )
     else:
         scanner = scanner_type(

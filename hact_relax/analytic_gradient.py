@@ -26,6 +26,7 @@ class Point:
     active_coeff: np.ndarray
     active_occ: np.ndarray
     cluster_df: object = None    # production's cluster DF object (its Cholesky vectors)
+    symmetry: tuple = None       # (n, AO rotation) holding the active solution
 
 
 def capture_point(surface, coords_bohr, reason="analytic-gradient-center"):
@@ -37,9 +38,11 @@ def capture_point(surface, coords_bohr, reason="analytic-gradient-center"):
     kept, surface.kept_centre = surface.kept_centre, None
     ref = surface.active_solution_reference
     solver = kept["solver"]
+    symmetry = (surface.site_symmetry(solver)
+                if getattr(surface.settings, "constrain_symmetry", False) else None)
     return Point(float(energy), kept["kmf"], solver,
                  np.asarray(ref.active_coeff).real.copy(),
-                 np.asarray(ref.active_occ).real.copy(), solver.cluster_df)
+                 np.asarray(ref.active_occ).real.copy(), solver.cluster_df, symmetry)
 
 
 def _gamma(x):
@@ -561,22 +564,29 @@ def active_hamiltonian(inp, chain):
     return h1e, DFEri(LC)
 
 
-def polish_active(h1e, eri, occ, tol=1e-11, max_cycle=6):
+def polish_active(h1e, eri, occ, tol=1e-11, max_cycle=6, ops=None):
     """Newton steps to an active orbital gradient below ``tol``; the rotation and a record.
+    With ``ops`` only invariant rotations count; ``gradient_after_full`` is the whole
+    gradient.
     """
     from frozen_bath_scf import second_order as so
     from frozen_bath_scf.orbital_optimizer import energy_at, newton_finish
 
+    project = so.symmetry_projector(ops, occ)
     e0 = energy_at(h1e, eri, occ)
-    u, h1e_new, eri_new, newton = newton_finish(h1e, eri, occ, tol, max_cycle)
+    u, h1e_new, eri_new, newton = newton_finish(h1e, eri, occ, tol, max_cycle,
+                                                project=project)
     lowest = newton.get("newton_lowest_hessian")
     if lowest is None:
-        lowest = float(so.lowest_hessian_modes(h1e, eri, occ)[0][0])
+        lowest = float(so.lowest_hessian_modes(h1e, eri, occ, project=project)[0][0])
     h1e, eri = h1e_new, eri_new
-    return u, {"gradient_before": newton["newton_gradient_before"], "lowest_hessian": lowest,
-               "cycles": newton["newton_cycles"], "stop": newton["newton_stop"],
-               "gradient_after": newton["newton_gradient_after"],
-               "energy_change": float(energy_at(h1e, eri, occ) - e0)}
+    info = {"gradient_before": newton["newton_gradient_before"], "lowest_hessian": lowest,
+            "cycles": newton["newton_cycles"], "stop": newton["newton_stop"],
+            "gradient_after": newton["newton_gradient_after"],
+            "energy_change": float(energy_at(h1e, eri, occ) - e0)}
+    if project is not None:
+        info["gradient_after_full"] = float(np.linalg.norm(so.orbital_gradient(h1e, eri, occ)))
+    return u, info
 
 
 # --------------------------------------------------------------------------- integrals
@@ -777,7 +787,13 @@ def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None
                            % (chain.energy, point.energy))
     stationarity = {"forward_minus_production": float(chain.energy - point.energy)}
     if polish:
-        u, info = polish_active(*active_hamiltonian(inp, chain), inp.act_occ)
+        ops = None
+        if point.symmetry is not None:
+            from hact_relax.symmetry import active_representation, rotation_group
+
+            n, rotation = point.symmetry
+            ops = rotation_group(active_representation(inp.act_coeff, inp.S, rotation)[0], n)
+        u, info = polish_active(*active_hamiltonian(inp, chain), inp.act_occ, ops=ops)
         stationarity.update(info)
         if info["cycles"]:
             inp.act_coeff = inp.act_coeff @ u

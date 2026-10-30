@@ -53,12 +53,14 @@ class Frozen_ROHF(FrozenActiveSpace, rohf.ROHF):
         mo_occ = mo_occ_active
         mo_coeff = mo_coeff_active
         Cacc = eye.copy()
+        ops = self.symmetry_ops
 
         for cycle in range(self.max_cycle):
             last_hf_e = e_elec
 
             dm = self.make_rdm1(mo_occ)
-            fock = self.get_fock(h1e, eye, vhf, dm, cycle, level_shift_factor=0.0)
+            fock = self._average_fock(
+                self.get_fock(h1e, eye, vhf, dm, cycle, level_shift_factor=0.0), ops)
             focka, fockb = fock.focka, fock.fockb
             dm_tot = dm[0] + dm[1]
 
@@ -75,6 +77,7 @@ class Frozen_ROHF(FrozenActiveSpace, rohf.ROHF):
             mo_energy, U = self.eig(fock, eye)
             mo_coeff = lib.einsum("ui, ij -> uj", mo_coeff, U)
             Cacc = Cacc.dot(U)
+            ops = self._rotate_ops(ops, U)
             mo_occ = self.get_occ(mo_energy, mo_coeff)
 
             h1e = self.get_hcore(h1e, U)
@@ -82,7 +85,8 @@ class Frozen_ROHF(FrozenActiveSpace, rohf.ROHF):
             e_elec = self.energy_elec(h1e, vhf, mo_occ)
 
             dm = self.make_rdm1(mo_occ)
-            fock = self.get_fock(h1e, eye, vhf, dm, cycle, level_shift_factor=0.0)
+            fock = self._average_fock(
+                self.get_fock(h1e, eye, vhf, dm, cycle, level_shift_factor=0.0), ops)
             norm_gorb = np.linalg.norm(self.get_grad(eye, mo_occ, fock))
 
             if self.scf_callback is not None:

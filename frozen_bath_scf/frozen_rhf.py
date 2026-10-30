@@ -42,28 +42,31 @@ class Frozen_RHF(FrozenActiveSpace, hf.SCF):
 
         mo_occ = mo_occ_active
         mo_coeff = mo_coeff_active
+        ops = self.symmetry_ops
 
         for cycle in range(self.max_cycle):
             last_hf_e = e_elec
 
-            fock = self.get_fock(h1e, eye, vhf, np.diag(mo_occ), cycle)
+            fock = self._average_fock(
+                self.get_fock(h1e, eye, vhf, np.diag(mo_occ), cycle), ops)
             mo_energy, U = self.eig(fock, eye)
             mo_coeff = lib.einsum("ui, ij -> uj", mo_coeff, U)
+            ops = self._rotate_ops(ops, U)
             mo_occ = self.get_occ(mo_energy, mo_coeff)
 
             h1e = self.get_hcore(h1e, U)
             vhf, eri_active = self.get_veff(mo_occ, eri_active, U)
             e_elec = self.energy_elec(h1e, vhf, mo_occ)
 
-            fock = self.get_fock(h1e, eye, vhf, np.diag(mo_occ))
+            fock = self._average_fock(self.get_fock(h1e, eye, vhf, np.diag(mo_occ)), ops)
             norm_gorb = np.linalg.norm(
                 self.get_grad(
                     eye,
                     mo_occ,
-                    self.get_fock(
+                    self._average_fock(self.get_fock(
                         h1e, eye, vhf, np.diag(mo_occ), cycle,
                         level_shift_factor=0.0,
-                    ),
+                    ), ops),
                 )
             )
 

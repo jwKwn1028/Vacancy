@@ -87,15 +87,18 @@ def apply_orbital_rotation(result, kappa, energy, *, canonicalize=True, info=Non
     return updated
 
 
-def minimize_and_finish(h1e, eri, occ, x0, newton_tol, escapes=2):
+def minimize_and_finish(h1e, eri, occ, x0, newton_tol, escapes=2, ops=None):
     """L-BFGS from ``x0``, then a Newton finish to ``newton_tol``; at a saddle the lowest
-    mode is followed both ways, at most ``escapes`` times.  Returns the rotation, energy,
+    mode is followed both ways, at most ``escapes`` times.  ``ops`` (a group in the frame
+    of h1e) restricts all of it to invariant rotations.  Returns the rotation, energy,
     gradient norm and record."""
-    _, kappa = minimize_orbitals(h1e, eri, occ, x0)
+    project = so.symmetry_projector(ops, occ)
+    keep = (lambda x: x) if project is None else project
+    _, kappa = minimize_orbitals(h1e, eri, occ, x0, project=project)
     u = so._expm_antisym(kappa)
     h1e, eri = rotate_hamiltonian(h1e, eri, u)
-    lbfgs = float(np.linalg.norm(so.orbital_gradient(h1e, eri, occ)))
-    v, h1e_n, eri_n, newton = newton_finish(h1e, eri, occ, newton_tol)
+    lbfgs = float(np.linalg.norm(keep(so.orbital_gradient(h1e, eri, occ))))
+    v, h1e_n, eri_n, newton = newton_finish(h1e, eri, occ, newton_tol, project=project)
     mode = newton.pop("lowest_mode", None)
     newton["lbfgs_gradient_norm"] = lbfgs
     newton["saddle_escapes"] = 0
@@ -103,7 +106,7 @@ def minimize_and_finish(h1e, eri, occ, x0, newton_tol, escapes=2):
         return (u @ v, float(energy_at(h1e_n, eri_n, occ)),
                 newton["newton_gradient_after"], newton)
     step = 0.2 * np.asarray(mode, dtype=float)
-    ends = [minimize_and_finish(h1e, eri, occ, sign * step, newton_tol, escapes - 1)
+    ends = [minimize_and_finish(h1e, eri, occ, sign * step, newton_tol, escapes - 1, ops)
             for sign in (1, -1)]
     lower = int(ends[1][1] < ends[0][1] - 1e-10)
     w, energy, gradient, record = ends[lower]
@@ -115,7 +118,7 @@ def minimize_and_finish(h1e, eri, occ, x0, newton_tol, escapes=2):
     return u @ w, energy, gradient, record
 
 
-def rescue_unconverged(result, gradient_limit, newton_tol=None):
+def rescue_unconverged(result, gradient_limit, newton_tol=None, ops=None):
     """Finish an unconverged frozen-bath SCF (minimize_and_finish); accepted, canonical, if
     its gradient is at most ``gradient_limit``."""
     if result[5] is None or result[6] is None:
@@ -125,7 +128,7 @@ def rescue_unconverged(result, gradient_limit, newton_tol=None):
     occ = np.asarray(result[4]).real
     u, energy, gradient, newton = minimize_and_finish(
         h1e, eri, occ, np.zeros(int(so.rotation_mask(occ).sum())),
-        gradient_limit if newton_tol is None else newton_tol,
+        gradient_limit if newton_tol is None else newton_tol, ops=ops,
     )
     info = {"scf_rescued": gradient <= gradient_limit,
             "scf_rescue_gradient_norm": gradient,
@@ -140,13 +143,15 @@ def rescue_unconverged(result, gradient_limit, newton_tol=None):
     return updated, info
 
 
-def follow_negative_mode(result, tol, newton_tol=1e-9):
-    """Follow the lowest orbital-Hessian mode below -``tol`` both ways and keep the lower
-    minimum, canonical.  Returns the result, whether a mode was followed, and the record."""
+def follow_negative_mode(result, tol, newton_tol=1e-9, ops=None):
+    """Follow the lowest orbital-Hessian mode below -``tol`` (among invariant rotations,
+    with ``ops``) both ways and keep the lower minimum, canonical.  Returns the result,
+    whether a mode was followed, and the record."""
     h1e = np.asarray(result[5]).real
     eri = as_eri(result[6])
     occ = np.asarray(result[4]).real
-    report = so.stability_analysis(h1e, eri, occ)
+    report = so.stability_analysis(h1e, eri, occ,
+                                   project=so.symmetry_projector(ops, occ))
     info = {
         "negative_mode_eigenvalue": float(report["lowest"]),
         "negative_mode_followed": False,
@@ -157,7 +162,8 @@ def follow_negative_mode(result, tol, newton_tol=1e-9):
 
     before = energy_at(h1e, eri, occ)
     mode = 0.2 * np.asarray(report["lowest_mode"], dtype=float)
-    ends = [minimize_and_finish(h1e, eri, occ, sign * mode, newton_tol) for sign in (1, -1)]
+    ends = [minimize_and_finish(h1e, eri, occ, sign * mode, newton_tol, ops=ops)
+            for sign in (1, -1)]
     lower = int(ends[1][1] < ends[0][1] - 1e-10)
     u, after, gradient, newton = ends[lower]
     info.update({
@@ -177,8 +183,9 @@ def follow_negative_mode(result, tol, newton_tol=1e-9):
             info)
 
 
-def symmetric_resolve(result, ops, newton_tol, tol=1e-10):
-    """Re-minimize from a symmetric frame and keep the lower minimum, canonical."""
+def symmetric_resolve(result, ops, newton_tol, tol=1e-10, constrained=False):
+    """Re-minimize from a symmetric frame (``constrained``: within invariant rotations) and
+    keep the lower minimum, canonical."""
     h1e = np.asarray(result[5]).real
     eri = as_eri(result[6])
     occ = np.asarray(result[4]).real
@@ -192,7 +199,8 @@ def symmetric_resolve(result, ops, newton_tol, tol=1e-10):
         return result, False, info
     h, e = rotate_hamiltonian(h1e, eri, frame)
     u, after, gradient, newton = minimize_and_finish(
-        h, e, occ, np.zeros(int(so.rotation_mask(occ).sum())), newton_tol)
+        h, e, occ, np.zeros(int(so.rotation_mask(occ).sum())), newton_tol,
+        ops=[frame.T @ w @ frame for w in ops] if constrained else None)
     info.update({
         "symmetric_start_energy_change_hartree": float(after - before),
         "symmetric_start_gradient_norm": gradient,
@@ -206,6 +214,46 @@ def symmetric_resolve(result, ops, newton_tol, tol=1e-10):
     info["symmetric_start_kept"] = True
     return (apply_orbital_rotation(result, None, after, info=info, rotation=frame @ u), True,
             info)
+
+
+def occupation_breaking(ops, occ):
+    """Largest change ``ops`` make to the frame's densities (0: invariant)."""
+    dm_a, dm_b = so.densities(occ)
+    return float(max(np.abs(w @ d @ w.T - d).max() for w in ops for d in (dm_a, dm_b)))
+
+
+def symmetric_solution(result, ops, newton_tol, gradient_limit):
+    """``result`` if it converged to an ``ops``-invariant determinant, else the minimum
+    within invariant rotations from symmetric_frame, accepted, canonical, if its gradient
+    is at most ``gradient_limit``.  Returns the result and a record."""
+    occ = np.asarray(result[4]).real
+    breaking = occupation_breaking(ops, occ)
+    info = {"symmetry_occupation_breaking": breaking, "symmetry_resolved": False}
+    if result[0] and breaking < 1e-8:
+        return result, info
+    h1e = np.asarray(result[5]).real
+    eri = as_eri(result[6])
+    frame, report = symmetric_frame(h1e, eri, occ, ops)
+    if frame is None:
+        info["symmetry_resolve_skipped"] = "no symmetric occupation"
+        updated = list(result)
+        updated[0] = False
+        return updated, info
+    h, e = rotate_hamiltonian(h1e, eri, frame)
+    u, energy, gradient, newton = minimize_and_finish(
+        h, e, occ, np.zeros(int(so.rotation_mask(occ).sum())), newton_tol,
+        ops=[frame.T @ w @ frame for w in ops])
+    info.update({"symmetry_resolved": gradient <= gradient_limit,
+                 "symmetry_resolve_gradient_norm": gradient,
+                 "symmetry_resolve_newton_stop": newton["newton_stop"],
+                 "symmetry_resolve_saddle_escapes": newton["saddle_escapes"]})
+    if not info["symmetry_resolved"]:
+        updated = list(result)
+        updated[0] = False
+        return updated, info
+    updated = apply_orbital_rotation(result, None, energy, info=info, rotation=frame @ u)
+    updated[0] = True
+    return updated, info
 
 
 @dataclass
@@ -230,6 +278,8 @@ class SurfaceSettings:
     rescue_tol_factor: float = 5.0
     # First centre: also minimize from a symmetric start, keep the lower.
     symmetric_start: bool = True
+    # Every centre: hold the SCF on states invariant under the rotation about the vacancy.
+    constrain_symmetry: bool = False
     checkpoint_eri: bool = True
     # --state excited: CASCI on H_act^V instead of the frozen-bath SCF energy.
     # Defaults reproduce the sibling repository's own defaults.
@@ -412,9 +462,9 @@ class ActiveHamiltonianSurface:
     def _rescue_limit(self) -> float:
         return self.settings.scf_conv_tol_grad * self.settings.rescue_tol_factor
 
-    def _rescue_unconverged_scf(self, result):
+    def _rescue_unconverged_scf(self, result, ops=None):
         return rescue_unconverged(result, self._rescue_limit(),
-                                  self.settings.scf_conv_tol_grad)
+                                  self.settings.scf_conv_tol_grad, ops)
 
     def _converge_on_center_branch(self, solver, result, start_rotation, start_occ):
         if start_rotation is None or start_occ is None:
@@ -456,13 +506,46 @@ class ActiveHamiltonianSurface:
         settings = self.settings
         return settings.rescue_tol_factor if settings.rescue_unconverged_scf else None
 
-    def _follow_negative_mode(self, result):
+    def _follow_negative_mode(self, result, ops=None):
         return follow_negative_mode(result, self.settings.follow_mode_tol,
-                                    self.settings.scf_conv_tol_grad)
+                                    self.settings.scf_conv_tol_grad, ops)
+
+    def site_symmetry(self, solver):
+        """(n, AO matrix) of the rotation about the vacancy, (None, None) if none: an error
+        under constrain_symmetry."""
+        n, rotation = site_rotation(solver.scell, solver.S, self.vacancy_index)
+        if n is None and self.settings.constrain_symmetry:
+            raise ValueError("--constrain-symmetry: no rotation about the vacancy maps this "
+                             "geometry onto itself")
+        return n, rotation
+
+    @staticmethod
+    def active_symmetry_ops(solver, coeff, symmetry):
+        """The rotation's group in the frame of ``coeff``, and the active space's invariance
+        (an error below 1 - 1e-6)."""
+        n, rotation = symmetry
+        w, invariance = active_representation(np.asarray(coeff).real, solver.S, rotation)
+        if invariance < 1.0 - 1e-6:
+            raise ValueError("--constrain-symmetry: C%d does not map the active space onto "
+                             "itself (invariance %.6f)" % (n, invariance))
+        return rotation_group(w, n), invariance
+
+    @staticmethod
+    def _symmetry_record(result):
+        """The full orbital gradient and lowest orbital-Hessian eigenvalue of the held state
+        (negative: a saddle)."""
+        occ = np.asarray(result[4]).real
+        report = so.stability_analysis(np.asarray(result[5]).real, as_eri(result[6]), occ)
+        print("# symmetry held: full orbital gradient %.1e, lowest full orbital Hessian "
+              "%+.3e%s" % (report["gradient_norm"], report["lowest"],
+                           " (the symmetric state is a saddle)" if report["lowest"] < 0
+                           else ""), flush=True)
+        return {"symmetry_full_gradient_norm": report["gradient_norm"],
+                "symmetry_full_lowest_hessian": report["lowest"]}
 
     def _symmetric_start(self, solver, result):
         """symmetric_resolve under the rotation about the vacancy, if one exists."""
-        n, rotation = site_rotation(solver.scell, solver.S, self.vacancy_index)
+        n, rotation = self.site_symmetry(solver)
         if n is None:
             return result, {"symmetric_start_order": None}
         w, invariance = active_representation(np.asarray(result[3]).real, solver.S,
@@ -471,7 +554,8 @@ class ActiveHamiltonianSurface:
             return result, {"symmetric_start_order": n, "symmetric_start_skipped":
                             "active space not invariant (%.6f)" % invariance}
         result, kept, info = symmetric_resolve(result, rotation_group(w, n),
-                                               self.settings.scf_conv_tol_grad)
+                                               self.settings.scf_conv_tol_grad,
+                                               constrained=self.settings.constrain_symmetry)
         info["symmetric_start_active_invariance"] = invariance
         change = info.get("symmetric_start_energy_change_hartree")
         print("# symmetric start (C%d about the vacancy): %s" % (
@@ -924,6 +1008,21 @@ class ActiveHamiltonianSurface:
                       % record["input_checkpoint_error"], flush=True)
 
         if relax_active:
+            symmetry = None
+            if settings.constrain_symmetry:
+                symmetry = self.site_symmetry(solver)
+                start = np.asarray(solver.mo_coeff[:, solver.active_orb]).real
+                if start_rotation is not None:
+                    start = start @ np.asarray(start_rotation, dtype=float)
+                solver.symmetry_ops, invariance = self.active_symmetry_ops(
+                    solver, start, symmetry)
+                record.update({"symmetry_constrained": True, "symmetry_order": symmetry[0],
+                               "symmetry_active_invariance": invariance})
+
+            def ops_of(result):
+                return (None if symmetry is None
+                        else self.active_symmetry_ops(solver, result[3], symmetry)[0])
+
             with self.recorder.stage(
                 "hact_scf", evaluation=evaluation, reason=reason
             ):
@@ -934,7 +1033,13 @@ class ActiveHamiltonianSurface:
                     start_occ=start_occ,
                 )
 
-                if not result[0] and settings.rescue_unconverged_scf:
+                if symmetry is not None:
+                    # Aufbau can split a degenerate set at the occupation boundary.
+                    result, hold = symmetric_solution(
+                        result, ops_of(result), settings.scf_conv_tol_grad,
+                        self._rescue_limit())
+                    record.update(hold)
+                elif not result[0] and settings.rescue_unconverged_scf:
                     if accept_center:
                         result, rescue = self._rescue_unconverged_scf(result)
                         record.update(rescue)
@@ -947,7 +1052,8 @@ class ActiveHamiltonianSurface:
                 if (result[0]
                         and (accept_center or self.last_center_followed)
                         and settings.follow_negative_mode):
-                    result, followed, mode = self._follow_negative_mode(result)
+                    result, followed, mode = self._follow_negative_mode(result,
+                                                                        ops_of(result))
                     record.update(mode)
                     if accept_center:
                         self.last_center_followed = bool(followed)
@@ -957,6 +1063,9 @@ class ActiveHamiltonianSurface:
                         and self.active_solution_reference is None):
                     result, symmetric = self._symmetric_start(solver, result)
                     record.update(symmetric)
+
+                if result[0] and symmetry is not None:
+                    record.update(self._symmetry_record(result))
         else:
             if start_rotation is None or start_occ is None:
                 raise RuntimeError(

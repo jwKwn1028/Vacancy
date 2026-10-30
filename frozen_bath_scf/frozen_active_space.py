@@ -3,11 +3,28 @@ import numpy as np
 from pyscf import lib
 
 from .df_eri import eri_j, eri_k, rotate_eri
+from .second_order import symmetrize
 
 
 class FrozenActiveSpace:
 
     scf_callback = None
+    # A group in the start frame: each cycle averages the Fock matrices over it.
+    symmetry_ops = None
+
+    @staticmethod
+    def _average_fock(fock, ops):
+        if ops is None:
+            return fock
+        out = symmetrize(np.asarray(fock), ops)
+        if getattr(fock, "focka", None) is None:
+            return out
+        return lib.tag_array(out, focka=symmetrize(fock.focka, ops),
+                             fockb=symmetrize(fock.fockb, ops))
+
+    @staticmethod
+    def _rotate_ops(ops, U):
+        return None if ops is None else [U.T @ w @ U for w in ops]
 
     def get_h1e(self):
         h1e_ao_ao = self.hcore.copy()

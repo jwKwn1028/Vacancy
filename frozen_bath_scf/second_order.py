@@ -30,6 +30,40 @@ def densities(mo_occ):
     return np.diag((occ > 0).astype(float)), np.diag((occ == 2).astype(float))
 
 
+def symmetrize(matrix, ops):
+    """The average of W M W^T over the group ``ops``."""
+    return sum(w @ matrix @ w.T for w in ops) / len(ops)
+
+
+def _block_ops(ops, mo_occ):
+    """``ops`` on the occupation blocks only, each block orthogonalized."""
+    occ = np.asarray(mo_occ)
+    blocks = [np.flatnonzero(np.isclose(occ, k)) for k in (2.0, 1.0, 0.0)]
+    out = []
+    for w in ops:
+        b = np.zeros_like(w)
+        for idx in blocks:
+            if idx.size:
+                u, _, vt = np.linalg.svd(w[np.ix_(idx, idx)])
+                b[np.ix_(idx, idx)] = u @ vt
+        out.append(b)
+    return out
+
+
+def symmetry_projector(ops, mo_occ):
+    """The orthogonal projector onto rotation vectors invariant under ``ops``, whose frame
+    must have invariant occupied spaces; None for no ops."""
+    if ops is None:
+        return None
+    mask = rotation_mask(mo_occ)
+    ops = _block_ops(ops, mo_occ)
+
+    def project(x):
+        return symmetrize(_kappa_from_vector(np.asarray(x, dtype=float), mask), ops)[mask]
+
+    return project
+
+
 def _expm_antisym(kappa):
     return expm(kappa)
 
@@ -116,27 +150,34 @@ def hessian_diagonal_estimate(h1e, eri, mo_occ):
 
 
 def lowest_hessian_modes(h1e, eri, mo_occ, nroots=1, tol=1e-8, max_cycle=200,
-                         step=1e-4, dense_below=64):
+                         step=1e-4, dense_below=64, project=None):
     """The ``nroots`` lowest orbital-Hessian eigenpairs, by Davidson on Hessian-vector
-    products (dense below ``dense_below`` rotations). Returns (values, vectors, converged,
-    products)."""
+    products (dense below ``dense_below`` rotations), within the range of ``project`` if
+    given. Returns (values, vectors, converged, products)."""
     from pyscf import lib
 
     mask = rotation_mask(mo_occ)
     n = int(mask.sum())
     if n <= max(dense_below, 2 * nroots + 2):
-        w, v = np.linalg.eigh(orbital_hessian(h1e, eri, mo_occ, step))
-        return w[:nroots], v[:, :nroots], True, n
+        hess = orbital_hessian(h1e, eri, mo_occ, step)
+        if project is None:
+            w, v = np.linalg.eigh(hess)
+            return w[:nroots], v[:, :nroots], True, n
+        pw, pv = np.linalg.eigh(np.array([project(e) for e in np.eye(n)]).T)
+        q = pv[:, pw > 0.5]
+        w, v = np.linalg.eigh(q.T @ hess @ q)
+        return w[:nroots], q @ v[:, :nroots], True, n
     diag = hessian_diagonal_estimate(h1e, eri, mo_occ)
     count = [0]
+    keep = (lambda x: x) if project is None else project
 
     def aop(xs):
         count[0] += len(xs)
-        return [hessian_vector(h1e, eri, mo_occ, x, step, mask) for x in xs]
+        return [keep(hessian_vector(h1e, eri, mo_occ, keep(x), step, mask)) for x in xs]
 
     def precond(r, e, x0):
         d = diag - e
-        return r / np.where(np.abs(d) > 1e-4, d, np.copysign(1e-4, d))
+        return keep(r / np.where(np.abs(d) > 1e-4, d, np.copysign(1e-4, d)))
 
     # Unit vectors alone can miss a whole symmetry block (Davidson never leaves the
     # space it starts in): a fixed random vector breaks the symmetry, and two extra
@@ -146,9 +187,10 @@ def lowest_hessian_modes(h1e, eri, mo_occ, nroots=1, tol=1e-8, max_cycle=200,
     for p in np.argsort(diag)[:nsolve + 2]:
         unit = np.zeros(n)
         unit[p] = 1.0
-        guesses.append(unit)
-    noise = np.random.default_rng(20261027).standard_normal(n)
-    guesses.append(noise / np.linalg.norm(noise))
+        guesses.append(keep(unit))
+    noise = keep(np.random.default_rng(20261027).standard_normal(n))
+    guesses.append(noise)
+    guesses = [g / np.linalg.norm(g) for g in guesses if np.linalg.norm(g) > 1e-8]
     conv, e, x = lib.davidson1(aop, guesses, precond, tol=tol, max_cycle=max_cycle,
                                max_space=max(24, 4 * nsolve), nroots=nsolve)
     e = np.atleast_1d(e)

@@ -21,6 +21,8 @@ HOST_FRAGMENTS = {
     LIF1D: FRAGMENTS,
     HBN2D: (1, 4, 10, 13, 19),
 }
+# Accepted only when named: "all" keeps its original meaning.
+HOST_NAMED_FRAGMENTS = {LIH1D: (11,), LIF1D: (11,)}
 HOST_DEFAULT_BASIS = {LIH1D: "pob-tzvp", LIF1D: "pob-tzvp", HBN2D: "cc-pvdz"}
 HOST_DEFAULT_FD_AXES = {LIH1D: "x", LIF1D: "x", HBN2D: "xy"}
 HOST_DEFAULT_WRAP = {LIH1D: False, LIF1D: False, HBN2D: True}
@@ -82,17 +84,18 @@ def case_host(case_names) -> str:
     return hosts[0]
 
 
-def parse_fragments(value: str, allowed=FRAGMENTS) -> list[int]:
+def parse_fragments(value: str, allowed=FRAGMENTS, named=()) -> list[int]:
     allowed = tuple(int(v) for v in allowed)
+    named = tuple(int(v) for v in named)
     values = list(allowed) if value == "all" else [
         int(v) for v in value.split(",")
     ]
     values = list(dict.fromkeys(values))
-    unknown = sorted(set(values) - set(allowed))
+    unknown = sorted(set(values) - set(allowed) - set(named))
     if unknown:
         raise ValueError(
             "fragment size(s) must be %s; got %s"
-            % (",".join(str(v) for v in allowed), unknown)
+            % (",".join(str(v) for v in allowed + named), unknown)
         )
     return values
 

@@ -24,6 +24,7 @@ from hact_relax.cases import (
     HOST_DEFAULT_BASIS,
     HOST_DEFAULT_FD_AXES,
     HOST_FRAGMENTS,
+    HOST_NAMED_FRAGMENTS,
     R_ANG,
     case_host,
     parse_cases,
@@ -215,7 +216,8 @@ def validate_args(parser: argparse.ArgumentParser, args):
     try:
         cases = parse_cases(args.cases)
         host = case_host(cases)
-        fragments = parse_fragments(args.fragments, HOST_FRAGMENTS[host])
+        fragments = parse_fragments(args.fragments, HOST_FRAGMENTS[host],
+                                    HOST_NAMED_FRAGMENTS.get(host, ()))
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     args.host = host

@@ -330,6 +330,7 @@ def _svd_left_adjoint(U, s, Vt, Ubar, nb, within_bath):
     bath unless ``within_bath``, are free."""
     nE = U.shape[0]
     nF = len(s)
+    Vt = Vt[:nF]
     sf = np.zeros(nE)
     sf[:nF] = s
     m = U.T @ Ubar

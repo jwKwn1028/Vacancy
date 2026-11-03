@@ -350,11 +350,9 @@ def _svd_left_adjoint(U, s, Vt, Ubar, nb, within_bath):
 def backward(inp, chain, within_bath=False, with_L=False):
     """Reverse mode through the chain: dE/d(each input) at fixed active solution."""
     v = chain.vals
-    S, L = inp.S, inp.cluster_L
-    F, E = inp.frag_lo, inp.env_lo
-    nF = len(F)
-    CA, CC, DP = v["CA"], v["CC"], v["DP"]
-    Da, Db, Ds, DAP, DC = v["Da"], v["Db"], v["Ds"], v["DAP"], v["DC"]
+    L = inp.cluster_L
+    CA, CC = v["CA"], v["CC"]
+    Da, Db, Ds, DAP = v["Da"], v["Db"], v["Ds"], v["DAP"]
     h = v["h"]
     jd, ka, kb, kn = v["jd"], v["ka"], v["kb"], v["kn"]
     ks = ka + kb
@@ -364,10 +362,40 @@ def backward(inp, chain, within_bath=False, with_L=False):
     eb = h + inp.vP + jd - kb + 0.5 * kn
     en = -0.5 * inp.vP - jd + 0.5 * ks - 0.5 * kn
     ec = h + 0.5 * inp.vP
-    Sbar = np.zeros_like(S)
-    DPbar = np.zeros_like(S)
     CAbar = 2 * (ea @ CA @ v["da"] + eb @ CA @ v["db"]) + 2 * en @ CA @ v["NA"]
     CCbar = 2 * ec @ CC @ v["NC"]
+    adj = embedding_adjoint(inp, chain, CAbar, CCbar, en, ec, within_bath)
+
+    if with_L:
+        if not isinstance(L, np.ndarray):
+            raise ValueError("with_L needs a dense cluster tensor")
+        delta = v["delta"]
+        Lbar = np.zeros_like(L)
+        jx = np.einsum("Pkl,kl->P", L, delta)
+        for P in range(len(L)):
+            lp = L[P]
+            Lbar[P] = (jx[P] * delta
+                       - 0.5 * (Da @ lp @ Da + Da @ lp @ Da + Db @ lp @ Db + Db @ lp @ Db)
+                       + 0.5 * (Ds @ lp @ DAP + DAP @ lp @ Ds)
+                       - 0.25 * 2 * DAP @ lp @ DAP)
+        adj.L = Lbar
+    return adj
+
+
+def embedding_adjoint(inp, chain, CAbar, CCbar, en, ec, within_bath=False):
+    """Reverse the embedding maps from active/core coefficient and projector adjoints.
+
+    ``en`` and ``ec`` differentiate the pristine active/core densities. The caller
+    supplies the explicit coefficient derivatives at fixed occupation projectors.
+    ``chain.vals['Ds']`` and ``Y`` also allow relaxed correlated density weights.
+    """
+    v = chain.vals
+    S = inp.S
+    F, E = inp.frag_lo, inp.env_lo
+    nF = len(F)
+    CA, CC, DP = v["CA"], v["CC"], v["DP"]
+    Sbar = np.zeros_like(S)
+    DPbar = np.zeros_like(S)
     for C, nbar_src, vec, ldd, Cbar_name in ((CA, en, v["vA"], v["LA"], "A"),
                                                (CC, ec, v["vC"], v["LC"], "C")):
         gbar = matfun_adjoint(vec, ldd, C.T @ nbar_src @ C)
@@ -452,22 +480,9 @@ def backward(inp, chain, within_bath=False, with_L=False):
     # D^P = 2 Co Co^T.
     Cobar += 2 * (DPbar + DPbar.T) @ Co
 
-    Lbar = None
-    if with_L:
-        if not isinstance(L, np.ndarray):
-            raise ValueError("with_L needs a dense cluster tensor")
-        delta = v["delta"]
-        Lbar = np.zeros_like(L)
-        jx = np.einsum("Pkl,kl->P", L, delta)
-        for P in range(len(L)):
-            lp = L[P]
-            Lbar[P] = (jx[P] * delta
-                       - 0.5 * (Da @ lp @ Da + Da @ lp @ Da + Db @ lp @ Db + Db @ lp @ Db)
-                       + 0.5 * (Ds @ lp @ DAP + DAP @ lp @ Ds)
-                       - 0.25 * 2 * DAP @ lp @ DAP)
-    P1 = Ds + DC
+    P1 = v["Ds"] + v["DC"]
     return Adjoints(S=Sbar, S12=S12bar, S2=S2bar, Co=Cobar, hP=P1, vP=v["Y"], V=-P1,
-                    L=Lbar, bath_rotation=rot)
+                    bath_rotation=rot)
 
 
 # --------------------------------------------------------------------------- Z-vector
@@ -678,7 +693,8 @@ def _aux_shell_blocks(auxmol, size, sh0=0, sh1=None):
         yield start, sh1
 
 
-def grad_cluster(mol, CA, xa, xb, xn, atoms, block_mb=None, bA=None, auxmol=None):
+def grad_cluster(mol, CA, xa, xb, xn, atoms, block_mb=None, bA=None, auxmol=None,
+                 weights=None):
     """d/dR of E_cl at fixed densities, streamed over auxiliary shell blocks; ``bA`` (C_A^T
     L C_A) saves the undifferentiated pass."""
     from pyscf import df as mol_df
@@ -713,15 +729,18 @@ def grad_cluster(mol, CA, xa, xb, xn, atoms, block_mb=None, bA=None, auxmol=None
         ct = scipy.linalg.solve_triangular(low, bA.reshape(len(bA), -1), lower=True,
                                            trans="T").reshape(bA.shape)
     del j2c
-    xs = xa + xb
-    dl = xs - xn
-    cd = np.einsum("Pij,ij->P", ct, dl)
-    pairs = ((xa, xa, -0.5), (xb, xb, -0.5), (xs, xn, 0.5), (xn, xn, -0.25))
-    g = np.einsum("P,ij->Pij", cd, dl)
-    w = 0.5 * np.outer(cd, cd)
-    for x, y, c in pairs:
-        g += c * (np.matmul(np.matmul(x, ct), y) + np.matmul(np.matmul(y, ct), x))
-        w += c * np.einsum("Pij,jk,Qkl,li->PQ", ct, x, ct, y, optimize=True)
+    if weights is None:
+        xs = xa + xb
+        dl = xs - xn
+        cd = np.einsum("Pij,ij->P", ct, dl)
+        pairs = ((xa, xa, -0.5), (xb, xb, -0.5), (xs, xn, 0.5), (xn, xn, -0.25))
+        g = np.einsum("P,ij->Pij", cd, dl)
+        w = 0.5 * np.outer(cd, cd)
+        for x, y, c in pairs:
+            g += c * (np.matmul(np.matmul(x, ct), y) + np.matmul(np.matmul(y, ct), x))
+            w += c * np.einsum("Pij,jk,Qkl,li->PQ", ct, x, ct, y, optimize=True)
+    else:
+        g, w = weights(ct)
     out = np.zeros((len(atoms), 3))
     for k, a in enumerate(atoms):
         sh = mol.aoslice_by_atom()[a]
@@ -755,63 +774,27 @@ class Gradient:
     zvector_density: np.ndarray = None    # Pz, the next geometry's guess
 
 
-def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None,
-                      zvector_tol=1e-10, keep_multipliers=False, fit_derivative="reverse",
-                      zvector_guess=None):
-    """dE/dR of ``movable``, which the fit must treat as moved.  ``polish`` makes the active
-    solution stationary first; ``keep_multipliers`` keeps each term's contraction matrices;
-    ``fit_derivative`` "pm" takes the fit term from two fit J/K per atom and axis instead
-    of the adjoints; ``zvector_guess`` (an earlier Gradient's zvector_density) starts the
-    Z-vector.
-    """
+def assemble_gradient(point, movable, inp, chain, adj, cluster, stationarity, timings,
+                      axes=(0, 1, 2), block_mb=None, zvector_tol=1e-10,
+                      keep_multipliers=False, fit_derivative="reverse", zvector_guess=None,
+                      cluster_weights=None):
+    """Contract prepared embedding adjoints and cluster weights with nuclear integrals."""
     import time
 
     from system import periodic_derivatives as pd
 
-    if fit_derivative not in ("reverse", "pm"):
-        raise ValueError("fit_derivative must be 'reverse' or 'pm'")
-    timings = {}
-    t0 = time.perf_counter()
     kmf, solver = point.kmf, point.solver
-    fit = kmf.with_df
-    if not hasattr(fit, "kfit"):
-        raise NotImplementedError("analytic gradient: the pristine host must use a FragmentFit")
-    missing = sorted(set(movable) - set(fit.moved))
-    if missing:
-        raise ValueError("atoms %s are not explicit in the fragment fit" % missing)
-    cell = solver.scell
-    cluster = ClusterDF(solver, block_mb, point.cluster_df)
-    inp = gather_inputs(point, cluster_L=cluster)
-    chain = forward(inp)
-    if abs(chain.energy - point.energy) > 1e-7:
-        raise RuntimeError("forward chain %.10f != production %.10f"
-                           % (chain.energy, point.energy))
-    stationarity = {"forward_minus_production": float(chain.energy - point.energy)}
-    if polish:
-        ops = None
-        if point.symmetry is not None:
-            from hact_relax.symmetry import active_representation, rotation_group
-
-            n, rotation = point.symmetry
-            ops = rotation_group(active_representation(inp.act_coeff, inp.S, rotation)[0], n)
-        u, info = polish_active(*active_hamiltonian(inp, chain), inp.act_occ, ops=ops)
-        stationarity.update(info)
-        if info["cycles"]:
-            inp.act_coeff = inp.act_coeff @ u
-            chain = forward(inp)
-    v = chain.vals
-    adj = backward(inp, chain)
-    timings["chain"] = time.perf_counter() - t0
+    fit, cell, v = kmf.with_df, solver.scell, chain.vals
     t0 = time.perf_counter()
     g = pristine_g(kmf)
-    cobar = adj.Co + 4 * g(v["Y"]) @ inp.Co
+    cobar = adj.Co + 4 * g(adj.vP) @ inp.Co
     resp = zvector(inp.S, solver.hcore + solver.vhf, inp.Co, cobar, g, tol=zvector_tol,
                    guess=zvector_guess)
     timings["zvector"] = time.perf_counter() - t0
 
     ms = 0.5 * (adj.S + adj.S.T) - resp.W
     mh = adj.hP + 0.5 * resp.Pz
-    my = v["Y"] + 0.5 * resp.Pz
+    my = adj.vP + 0.5 * resp.Pz
     atoms = sorted(int(i) for i in movable)
     parts = {}
     t0 = time.perf_counter()
@@ -827,12 +810,12 @@ def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None
     SCA = inp.S @ v["CA"]
     parts["cluster"] = grad_cluster(cluster.mol, v["CA"], v["da"], v["db"],
                                     SCA.T @ v["DAP"] @ SCA, atoms, block_mb, bA=v["bA"],
-                                    auxmol=cluster.df.auxmol)
+                                    auxmol=cluster.df.auxmol, weights=cluster_weights)
     timings["cluster"] = time.perf_counter() - t0
     t0 = time.perf_counter()
     der = pd.FitDerivative(fit)
     timings["fit_setup"] = time.perf_counter() - t0
-    adj = der.adjoints(my, v["DP"]) if fit_derivative == "reverse" else None
+    fit_adj = der.adjoints(my, v["DP"]) if fit_derivative == "reverse" else None
     fitg = np.zeros((len(atoms), 3))
     nucg = np.zeros((len(atoms), 3))
     timings["fit_integrals"] = timings["nuclear_rows"] = 0.0
@@ -840,13 +823,13 @@ def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None
         t = time.perf_counter()
         ints = der.atom_integrals(a, axes)
         timings["fit_integrals"] += time.perf_counter() - t
-        fitg[k] = (der.fit_gradient(a, ints, my, v["DP"], axes=axes) if adj is None
-                   else der.reverse_gradient(a, ints, adj, axes=axes))
+        fitg[k] = (der.fit_gradient(a, ints, my, v["DP"], axes=axes) if fit_adj is None
+                   else der.reverse_gradient(a, ints, fit_adj, axes=axes))
         t = time.perf_counter()
         nucg[k] = der.nuclear_rows_gradient(a, ints, mh)
         timings["nuclear_rows"] += time.perf_counter() - t
         del ints
-    del adj
+    del fit_adj
     timings["fit_adjoints"] = der.timings["adjoints"]
     timings["fit_reverse"] = der.timings["reverse"]
     for key in ("rows", "to_coords", "aux_pairs", "metric_rows"):
@@ -855,7 +838,8 @@ def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None
     timings["fit_pm_jk"] = der.timings["bilinear"]
     timings["fit_and_nuclear_rows"] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    field = pd.nucleus_field(cell, mh, atoms, fit.settings)
+    field = pd.nucleus_field(cell, mh, atoms, fit.settings,
+                             **({} if block_mb is None else {"block_mb": block_mb}))
     nucg -= cell.atom_charges()[atoms][:, None] * field
     timings["nucleus_field"] = time.perf_counter() - t0
     parts["fit"] = fitg
@@ -877,3 +861,52 @@ def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None
                              "fit_derivative": fit_derivative,
                              "fit_pm_jk_calls": der.timings["bilinear_calls"]},
                     multipliers=multipliers, zvector_density=resp.Pz)
+
+
+def analytic_gradient(point, movable, axes=(0, 1, 2), polish=True, block_mb=None,
+                      zvector_tol=1e-10, keep_multipliers=False, fit_derivative="reverse",
+                      zvector_guess=None):
+    """dE/dR of ``movable``, which the fit must treat as moved.  ``polish`` makes the active
+    solution stationary first; ``keep_multipliers`` keeps each term's contraction matrices;
+    ``fit_derivative`` "pm" takes the fit term from two fit J/K per atom and axis instead
+    of the adjoints; ``zvector_guess`` (an earlier Gradient's zvector_density) starts the
+    Z-vector.
+    """
+    import time
+
+    if fit_derivative not in ("reverse", "pm"):
+        raise ValueError("fit_derivative must be 'reverse' or 'pm'")
+    timings = {}
+    t0 = time.perf_counter()
+    kmf, solver = point.kmf, point.solver
+    fit = kmf.with_df
+    if not hasattr(fit, "kfit"):
+        raise NotImplementedError("analytic gradient: the pristine host must use a FragmentFit")
+    missing = sorted(set(movable) - set(fit.moved))
+    if missing:
+        raise ValueError("atoms %s are not explicit in the fragment fit" % missing)
+    cluster = ClusterDF(solver, block_mb, point.cluster_df)
+    inp = gather_inputs(point, cluster_L=cluster)
+    chain = forward(inp)
+    if abs(chain.energy - point.energy) > 1e-7:
+        raise RuntimeError("forward chain %.10f != production %.10f"
+                           % (chain.energy, point.energy))
+    stationarity = {"forward_minus_production": float(chain.energy - point.energy)}
+    if polish:
+        ops = None
+        if point.symmetry is not None:
+            from hact_relax.symmetry import active_representation, rotation_group
+
+            n, rotation = point.symmetry
+            ops = rotation_group(active_representation(inp.act_coeff, inp.S, rotation)[0], n)
+        u, info = polish_active(*active_hamiltonian(inp, chain), inp.act_occ, ops=ops)
+        stationarity.update(info)
+        if info["cycles"]:
+            inp.act_coeff = inp.act_coeff @ u
+            chain = forward(inp)
+    adj = backward(inp, chain)
+    timings["chain"] = time.perf_counter() - t0
+    return assemble_gradient(point, movable, inp, chain, adj, cluster, stationarity, timings,
+                             axes=axes, block_mb=block_mb, zvector_tol=zvector_tol,
+                             keep_multipliers=keep_multipliers,
+                             fit_derivative=fit_derivative, zvector_guess=zvector_guess)

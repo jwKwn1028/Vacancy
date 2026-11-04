@@ -50,6 +50,7 @@ from hact_relax.gradient import (
     save_final_gradient,
     write_constraints,
 )
+from hact_relax.model_hessian import write_model_hessian
 from hact_relax.recording import RunRecorder
 from hact_relax.surface import ActiveHamiltonianSurface, SurfaceSettings
 from hact_relax.symmetry import SiteGroup
@@ -367,6 +368,7 @@ def run_configuration(
         "convergence_drms": float(args.convergence_drms),
         "convergence_dmax": float(args.convergence_dmax),
         "tmax": float(args.tmax),
+        "initial_hessian": str(getattr(args, "initial_hessian", "guess")),
         "single_point": bool(args.single_point),
         "energy_only": bool(getattr(args, "energy_only", False)),
         "allow_unconverged_geometry": bool(args.allow_unconverged_geometry),
@@ -550,6 +552,12 @@ def run_one(
         )
     # A restart hands geomeTRIC the saved Hessian; PySCF would overwrite a file: Hessian.
     restart_hessian = getattr(getattr(scanner, "restart", None), "hessian_file", None)
+    if (restart_hessian is None and not args.single_point
+            and getattr(args, "initial_hessian", "guess") == "lindh"):
+        restart_hessian = write_model_hessian(output_dir / "initial_hessian.txt", driver_mol,
+                                              lattice_bohr, movable, args.fd_axis_indices)
+        if hasattr(scanner, "hessian"):
+            scanner.hessian = np.loadtxt(restart_hessian)
     hessian_options = ({} if restart_hessian is None else
                        {"hessian": "file:%s" % restart_hessian, "frequency": False})
 

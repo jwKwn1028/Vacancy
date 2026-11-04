@@ -194,6 +194,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--convergence-drms", type=float, default=1.2e-3)
     parser.add_argument("--convergence-dmax", type=float, default=1.8e-3)
     parser.add_argument("--tmax", type=float, default=0.15)
+    parser.add_argument("--initial-hessian", choices=("guess", "lindh"), default="guess",
+                        help="starting Hessian: geomeTRIC's guess (0.5) or Lindh's model "
+                             "(--restart keeps its saved one)")
     parser.add_argument("--allow-unconverged-geometry", action="store_true")
     parser.add_argument("--single-point", action="store_true")
     parser.add_argument("--energy-only", action="store_true",

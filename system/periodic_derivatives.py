@@ -14,6 +14,8 @@ from pyscf.gto.mole import ANG_OF, ATOM_OF, NCTR_OF, NPRIM_OF, PTR_COEFF, PTR_EX
 DERIVATIVE_PRECISION = 1e-12
 # Tighter for the nucleus field: cheap (nuclei only), and steep core shells need it.
 FIELD_PRECISION = 1e-14
+# Memory share (of max_memory) for one FitDerivative pass over several moved atoms.
+GROUP_MEMORY_FRACTION = 0.1
 
 
 def _derivative_integral_cell(cell, precision=None):
@@ -106,6 +108,15 @@ def atom_shells(cell, atoms):
     return [i for i in range(cell.nbas) if int(cell._bas[i, ATOM_OF]) in set(atoms)]
 
 
+def derivative_functions(cell, atoms):
+    """Cartesian derivative functions (ang +- 1) of the shells on ``atoms``."""
+    n = 0
+    for i in atom_shells(cell, atoms):
+        ang, nctr = int(cell._bas[i, ANG_OF]), int(cell._bas[i, NCTR_OF])
+        n += ((ang + 2) * (ang + 3) // 2 + ang * (ang + 1) // 2) * nctr
+    return n
+
+
 def cart_to_original(cell):
     """(n_cart, n_orig) map from the Cartesian functions of ``cell`` to its own."""
     if cell.cart:
@@ -157,14 +168,59 @@ def raw_rows(cell, auxcell, atoms, settings):
     return v[:, :, np.argsort(perm)]
 
 
+def _tri(i):
+    return i * (i + 1) // 2
+
+
+def _lower_block(pcell, auxcell, settings, first):
+    """Raw Gamma (P|ab) less the G = 0 term, a on shells from ``first``, b before them:
+    (naux, nrow, ncol), from the packed lower triangle."""
+    from system.fragment_fit import RowBuilder, h5_steps
+
+    builder = RowBuilder(pcell, auxcell, settings)
+    loc = pcell.ao_loc_nr()
+    ncol = int(loc[first])
+    out = np.empty((auxcell.nao_nr(), int(loc[-1]) - ncol, ncol))
+    g0 = None
+    row = ncol
+    for v in h5_steps(builder, aosym="s2",
+                       shls_slice=(first, pcell.nbas, 0, pcell.nbas, 0, auxcell.nbas)):
+        if g0 is None:
+            g0 = builder.g0_term()
+        end = _tri(row) + v.shape[1]
+        r1 = int((np.sqrt(8 * end + 1) - 1) // 2)
+        if _tri(r1) != end:
+            raise RuntimeError("a packed step does not end on a row")
+        i = np.arange(row, r1)
+        blk = v[:, (_tri(i) - _tri(row))[:, None] + np.arange(ncol)]
+        if g0[0] is not None:
+            blk -= g0[0][:, None, None] * g0[1][row:r1, :ncol]
+        out[:, row - ncol:r1 - ncol] = blk
+        row = r1
+    if row != loc[-1]:
+        raise RuntimeError("the packed pass missed rows")
+    return out
+
+
+def _derivative_block(cell, auxcell, shells, settings):
+    """Raw Gamma (P|d b) less the G = 0 term, d the derivative functions of ``shells``, b
+    every function (Cartesian): (naux, n_d, n_ao), and rec.  The smaller set goes last, so
+    the packed pass wastes only its triangle."""
+    dcell, nd, rec = derivative_cell(cell, shells)
+    nao = int(cell.ao_loc_nr(cart=True)[-1])
+    if rec.shape[1] <= nao:
+        last = dcell.copy(deep=False)
+        last._bas = np.asarray(np.vstack([dcell._bas[nd:], dcell._bas[:nd]]), dtype=np.int32)
+        return _lower_block(last, auxcell, settings, cell.nbas), rec
+    return _lower_block(dcell, auxcell, settings, nd).transpose(0, 2, 1), rec
+
+
 def derivative_rows(cell, auxcell, atoms, settings, precision=None):
     """d/dA_x (P|ab) for a on ``atoms``: (3, naux, nrow, nao)."""
     cell = _derivative_integral_cell(cell, precision)
     auxcell = _derivative_integral_cell(auxcell, precision)
     shells = atom_shells(cell, atoms)
-    dcell, nd, rec = derivative_cell(cell, shells)
-    aux = _cart(auxcell)
-    v = _row_pass(dcell, aux, settings, nd, (nd, dcell.nbas))
+    v, rec = _derivative_block(cell, _cart(auxcell), shells, settings)
     v = np.tensordot(cart_to_original(auxcell), v, axes=(0, 0))
     v = v @ cart_to_original(cell)
     return np.einsum("xdm,Pdn->xPmn", rec, v, optimize=True)
@@ -218,15 +274,15 @@ def derivative_metric_rows(cell, auxcell, atoms, others, settings):
     """d/dA_x (P|Q) for P of ``auxcell`` on ``atoms`` and Q of ``others``: (3,
     n_aux_on_atoms, n_others)."""
     from pyscf.pbc.gto.cell import conc_cell
-    from system.fragment_fit import gamma_metric
+    from system.fragment_fit import gamma_metric_rows
 
     cell = _derivative_integral_cell(cell)
     auxcell = _derivative_integral_cell(auxcell)
     others = _derivative_integral_cell(others)
     daux, rec = derivative_aux_cell(auxcell, atoms)
     nd = daux.nao_nr()
-    j2c = gamma_metric(cell, conc_cell(daux, _cart(others)), settings)
-    block = j2c[:nd, nd:] @ cart_to_original(others)
+    rows = gamma_metric_rows(cell, conc_cell(daux, _cart(others)), np.arange(nd), settings)
+    block = rows[:, nd:] @ cart_to_original(others)
     return np.einsum("xdP,dQ->xPQ", rec, block, optimize=True)
 
 
@@ -270,7 +326,7 @@ class FitDerivative:
 
     def __init__(self, fit):
         from pyscf.pbc.df import df as pbc_df
-        from system.fragment_fit import gamma_metric, with_atoms
+        from system.fragment_fit import moving_metric, with_atoms
 
         self.fit = fit
         self.timings = {"vector_derivatives": 0.0, "bilinear": 0.0, "bilinear_calls": 0,
@@ -290,11 +346,12 @@ class FitDerivative:
         sl = self.auxcell.aoslice_by_atom()
         self.xf = np.concatenate([np.arange(sl[i][2], sl[i][3]) for i in moved])
         nx = self.nx = len(self.xf)
-        j2c = gamma_metric(cell, pbc_df.make_auxcell(
-            with_atoms(cell, new + list(ideal._atom)), kfit.auxbasis), self.settings)
-        dj = j2c[:nx, nx:] - j2c[nx + self.xf, nx:]
-        djff = j2c[:nx, :nx] - j2c[np.ix_(nx + self.xf, nx + self.xf)]
-        del j2c
+        # Reuse the fit's own moving-auxiliary metric rows.
+        known = getattr(fit, "moving_metric", None)
+        if known is None:
+            _, dj, djff = moving_metric(cell, ideal, self.auxcell, moved, kfit, self.settings)
+        else:
+            dj, djff = known
         ex = np.zeros((nx, kfit.nk * kfit.naux))
         ex[np.arange(nx), self.xf] = 1.0
         self.q = np.linalg.qr(kfit.coords(ex))[0]
@@ -329,36 +386,92 @@ class FitDerivative:
         s = self.auxnew.aoslice_by_atom()[k]
         return k, int(s[2]), int(s[3])
 
-    def atom_integrals(self, atom, axes=(0, 1, 2)):
-        """The derivative integrals one atom's motion needs; ex and dpairs on ``axes`` only."""
+    @cached_property
+    def metric_rows(self):
+        """derivative_metric_rows for every moved atom, in one pass."""
+        from pyscf.pbc.gto.cell import conc_cell
+
+        t = time.perf_counter()
+        others = conc_cell(self.auxnew, self.auxcell)
+        out = derivative_metric_rows(self.cell, self.auxnew, list(range(len(self.moved))),
+                                     others, self.settings)
+        self.timings["metric_rows"] += time.perf_counter() - t
+        return out
+
+    def _atom_mb(self, atom, naux):
+        """MB an atom's rows and auxiliary pairs take in a shared pass."""
+        cell = self.cell
+        nao = cell.nao_nr()
+        p0, p1 = cell.aoslice_by_atom()[atom][2:]
+        mb = 8e-6 * naux * nao * (3 * (p1 - p0) + 2 * derivative_functions(cell, [atom]))
+        if self.nx:
+            k, q0, q1 = self._new_slice(atom)
+            npair = nao * (nao + 1) // 2
+            mb += 8e-6 * npair * (3 * (q1 - q0) + 2 * derivative_functions(self.auxnew, [k]))
+        return mb
+
+    def atom_groups(self, atoms, budget_mb=None):
+        """Sorted ``atoms`` in groups that fit ``budget_mb`` (default: GROUP_MEMORY_FRACTION
+        of max_memory), one atom at least."""
+        if budget_mb is None:
+            budget_mb = GROUP_MEMORY_FRACTION * float(self.cell.max_memory)
+        naux = self.kfit.nk * self.kfit.naux + self.auxnew.nao_nr() + self.cell.natm
+        groups, size = [], 0.0
+        for a in sorted(int(i) for i in atoms):
+            mb = self._atom_mb(a, naux)
+            if groups and size + mb <= budget_mb:
+                groups[-1].append(a)
+                size += mb
+            else:
+                groups.append([a])
+                size = mb
+        return groups
+
+    def atom_integrals_many(self, atoms, axes=(0, 1, 2), budget_mb=None):
+        """(atom, atom_integrals(atom, axes)) in ascending order, one pass per atom group."""
         from pyscf.pbc.df import aft
         from pyscf.pbc.gto.cell import conc_cell
 
         cell, kfit, tm = self.cell, self.kfit, self.timings
         aux = conc_cell(conc_cell(self.auxcell, self.auxnew), aft._fake_nuc(cell, with_pseudo=False))
-        t = time.perf_counter()
-        rows = derivative_rows(cell, aux, [atom], self.settings)   # (3, naux_all, nrow, nao)
-        tm["rows"] += time.perf_counter() - t
         nsc = kfit.nk * kfit.naux
         nnew = self.auxnew.nao_nr()
-        t = time.perf_counter()
-        ex = {x: rows_to_coords(kfit, rows[x, :nsc]) for x in axes}
-        tm["to_coords"] += time.perf_counter() - t
-        vnuc = -np.tensordot(cell.atom_charges(), rows[:, nsc + nnew:], axes=(0, 1))
-        if self.nx == 0:
-            return dict(ex=ex, vnuc=vnuc)
-        dvx = rows[:, nsc:nsc + self.nx] - rows[:, self.xf]
-        del rows
-        k, p0, p1 = self._new_slice(atom)
-        t = time.perf_counter()
-        dpairs = derivative_aux_pairs(cell, self.auxnew, [k], self.settings)
-        dpairs = {x: dpairs[x].copy() for x in axes}
-        tm["aux_pairs"] += time.perf_counter() - t
-        t = time.perf_counter()
-        others = conc_cell(self.auxnew, self.auxcell)
-        dmet = derivative_metric_rows(cell, self.auxnew, [k], others, self.settings)
-        tm["metric_rows"] += time.perf_counter() - t
-        return dict(ex=ex, dvx=dvx, vnuc=vnuc, dpairs=dpairs, dmet=dmet, slice=(p0, p1))
+        charges = cell.atom_charges()
+        sl = cell.aoslice_by_atom()
+        for group in self.atom_groups(atoms, budget_mb):
+            t = time.perf_counter()
+            rows = derivative_rows(cell, aux, group, self.settings)   # (3, naux_all, nrow, nao)
+            tm["rows"] += time.perf_counter() - t
+            dpairs = dmet = None
+            if self.nx:
+                t = time.perf_counter()
+                dpairs = derivative_aux_pairs(cell, self.auxnew,
+                                              [self.moved.index(a) for a in group], self.settings)
+                tm["aux_pairs"] += time.perf_counter() - t
+                dmet = self.metric_rows
+            r0 = q0 = 0
+            for a in group:
+                r = rows[:, :, r0:r0 + int(sl[a][3] - sl[a][2])]
+                r0 += r.shape[2]
+                t = time.perf_counter()
+                ex = {x: rows_to_coords(kfit, r[x, :nsc]) for x in axes}
+                tm["to_coords"] += time.perf_counter() - t
+                vnuc = -np.tensordot(charges, r[:, nsc + nnew:], axes=(0, 1))
+                if self.nx == 0:
+                    yield a, dict(ex=ex, vnuc=vnuc)
+                    continue
+                dvx = r[:, nsc:nsc + self.nx] - r[:, self.xf]
+                _, p0, p1 = self._new_slice(a)
+                q1 = q0 + p1 - p0
+                yield a, dict(ex=ex, dvx=dvx, vnuc=vnuc,
+                              dpairs={x: dpairs[x, q0:q1].copy() for x in axes},
+                              dmet=dmet[:, p0:p1], slice=(p0, p1))
+                q0 = q1
+            del rows, dpairs
+
+    def atom_integrals(self, atom, axes=(0, 1, 2)):
+        """The derivative integrals one atom's motion needs; ex and dpairs on ``axes`` only."""
+        return next(self.atom_integrals_many([atom], axes))[1]
 
     def vector_derivatives(self, atom, ints, x):
         """dE (rows of E, all columns) and d(low) for d/dA_x."""

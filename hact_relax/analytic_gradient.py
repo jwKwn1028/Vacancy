@@ -819,16 +819,23 @@ def assemble_gradient(point, movable, inp, chain, adj, cluster, stationarity, ti
     fitg = np.zeros((len(atoms), 3))
     nucg = np.zeros((len(atoms), 3))
     timings["fit_integrals"] = timings["nuclear_rows"] = 0.0
-    for k, a in enumerate(atoms):
+    index = {a: k for k, a in enumerate(atoms)}
+    stream = der.atom_integrals_many(atoms, axes)
+    while True:
         t = time.perf_counter()
-        ints = der.atom_integrals(a, axes)
+        item = next(stream, None)
         timings["fit_integrals"] += time.perf_counter() - t
+        if item is None:
+            break
+        a, ints = item
+        k = index[a]
         fitg[k] = (der.fit_gradient(a, ints, my, v["DP"], axes=axes) if fit_adj is None
                    else der.reverse_gradient(a, ints, fit_adj, axes=axes))
         t = time.perf_counter()
         nucg[k] = der.nuclear_rows_gradient(a, ints, mh)
         timings["nuclear_rows"] += time.perf_counter() - t
-        del ints
+        del ints, item
+    timings["fit_groups"] = len(der.atom_groups(atoms))
     del fit_adj
     timings["fit_adjoints"] = der.timings["adjoints"]
     timings["fit_reverse"] = der.timings["reverse"]

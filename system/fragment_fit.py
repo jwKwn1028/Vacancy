@@ -276,6 +276,119 @@ def gamma_metric(cell, auxcell, settings):
     return np.asarray(builder.get_2c2e(np.zeros((1, 3)))[0])
 
 
+def _row_shell_runs(cell, keep):
+    """Consecutive shell ranges of ``cell`` holding a function that ``keep`` marks."""
+    loc = cell.ao_loc_nr()
+    inside = [bool(keep[loc[s]:loc[s + 1]].any()) for s in range(cell.nbas)]
+    runs, s = [], 0
+    while s < cell.nbas:
+        if inside[s]:
+            e = s
+            while e < cell.nbas and inside[e]:
+                e += 1
+            runs.append((s, e))
+            s = e
+        else:
+            s += 1
+    return runs
+
+
+def gamma_metric_rows(cell, auxcell, rows, settings):
+    """gamma_metric(cell, auxcell, settings)[rows]: PySCF's Gamma get_2c2e on those rows only."""
+    rows = np.asarray(rows, dtype=int)
+    builder = GammaBuilder(cell, auxcell, settings)
+    if auxcell.dimension == 0 or not builder.has_long_range():
+        return gamma_metric(cell, auxcell, settings)[rows]
+    omega = builder.omega
+    rs_aux = ft_ao._RangeSeparatedCell.from_cell(auxcell, builder.ke_cutoff,
+                                                 verbose=builder.verbose)
+    naux = auxcell.nao
+    where = np.full(naux, -1)
+    where[rows] = np.arange(len(rows))
+    out = np.zeros((len(rows), naux))
+    precision = auxcell.precision ** 1.5
+    aux_c = rs_aux.compact_basis_cell()
+    sr = None
+    if aux_c.nbas > 0:
+        aux_c.rcut = rsdf_builder.estimate_rs_2c2e_rcut(aux_c, omega, precision)
+        compact_bas = np.where(rs_aux.bas_type != ft_ao.SMOOTH_BASIS)[0]
+        compact_ao = rs_aux.get_ao_indices(compact_bas)
+        ao_map = auxcell.get_ao_indices(rs_aux.bas_map[compact_bas])
+        keep = where[ao_map] >= 0
+        sel = np.flatnonzero(keep)
+        loc = aux_c.ao_loc_nr()
+        sr = np.zeros((len(sel), aux_c.nao))
+        start = 0
+        with aux_c.with_short_range_coulomb(omega):
+            for s0, s1 in _row_shell_runs(aux_c, keep):
+                blk = np.asarray(aux_c.pbc_intor("int2c2e", hermi=0, kpts=np.zeros((1, 3)),
+                                                 shls_slice=(s0, s1, 0, aux_c.nbas)))[0].real
+                blk = blk[keep[loc[s0]:loc[s1]]]
+                sr[start:start + len(blk)] = blk
+                start += len(blk)
+    ke = rsdf_builder.estimate_ke_cutoff_for_omega(auxcell, omega, precision)
+    mesh = auxcell.cutoff_to_mesh(ke)
+    if cell.dimension == 2 and cell.low_dim_ft_type != "inf_vacuum":
+        mesh[2] = rsdf_builder._estimate_meshz(auxcell)
+    elif cell.dimension < 2:
+        mesh[cell.dimension:] = cell.mesh[cell.dimension:]
+    mesh = cell.symmetrize_mesh(mesh)
+    Gv, Gvbase, kws = auxcell.get_Gv_weights(mesh)
+    b = auxcell.reciprocal_vectors()
+    gxyz = lib.cartesian_prod([np.arange(len(x)) for x in Gvbase])
+    ngrids = Gv.shape[0]
+    max_memory = max(1000, builder.max_memory - lib.current_memory()[0])
+    blksize = min(ngrids, int(max_memory * .4e6 / 16 / rs_aux.nao), 200000)
+    kpt = np.zeros(3)
+    coulG = builder.weighted_coulG(kpt, False, mesh)
+    if sr is None:
+        for p0, p1 in lib.prange(0, ngrids, blksize):
+            aux_g = ft_ao.ft_ao(auxcell, Gv[p0:p1], None, b, gxyz[p0:p1], Gvbase, kpt).T
+            out += lib.dot(aux_g[rows].conj() * coulG[p0:p1], aux_g.T).real
+        return out
+    if cell.dimension == 3 or (cell.dimension == 2 and cell.low_dim_ft_type != "inf_vacuum"):
+        with lib.temporary_env(cell, dimension=3):
+            coulG_sr = builder.weighted_coulG_SR(kpt, False, mesh)
+        if omega != 0:
+            coulG_sr[0] += np.pi / omega ** 2 * kws
+    else:
+        coulG_sr = builder.weighted_coulG_SR(kpt, False, mesh)
+    recontract = rs_aux.recontract()
+    for p0, p1 in lib.prange(0, ngrids, blksize):
+        aux_g = ft_ao.ft_ao(rs_aux, Gv[p0:p1], None, b, gxyz[p0:p1], Gvbase, kpt).T
+        g_sr = aux_g[compact_ao]
+        sr -= lib.dot(g_sr[sel].conj() * coulG_sr[p0:p1], g_sr.T).real
+        aux_g = recontract(aux_g)
+        out += lib.dot(aux_g[rows].conj() * coulG[p0:p1], aux_g.T).real
+    np.add.at(out, (where[ao_map[sel]][:, None], ao_map[None, :]), sr)
+    return out
+
+
+def moving_metric(cell, ideal, auxcell, moved, kfit, settings):
+    """(xf, dj, djff): the moved atoms' auxiliary indices in ``auxcell`` (ideal) and their
+    metric rows, moved minus ideal, against the ideal functions and each other.  The ideal
+    rows are cached on ``kfit``."""
+    sl = auxcell.aoslice_by_atom()
+    xf = np.concatenate([np.arange(sl[i][2], sl[i][3]) for i in moved])
+    nx = len(xf)
+    new = [cell._atom[i] for i in moved]
+    both = pbc_df.make_auxcell(with_atoms(cell, new + list(ideal._atom)), kfit.auxbasis)
+    key = (tuple(int(i) for i in moved), float(cell.precision))
+    cached = getattr(kfit, "ideal_metric_rows", None)
+    if cached is not None and cached[0] == key:
+        rows = gamma_metric_rows(cell, both, np.arange(nx), settings)
+        ideal_rows = cached[1]
+    else:
+        rows = gamma_metric_rows(cell, both, np.concatenate([np.arange(nx), nx + xf]),
+                                 settings)
+        ideal_rows = rows[nx:, nx:].copy()
+        rows = rows[:nx]
+        kfit.ideal_metric_rows = (key, ideal_rows)
+    dj = rows[:, nx:] - ideal_rows
+    djff = rows[:, :nx] - ideal_rows[:, xf]
+    return xf, dj, djff
+
+
 class KpointFit(KpointOutside):
     """The k-point fit in k-space, with the metric factor of each momentum."""
 
@@ -318,10 +431,12 @@ class KpointFit(KpointOutside):
         self._vnuc = None
         # Threads for exchange (None: PySCF's count).
         self.workers = None
-        # Single entries, keyed by the moved atoms: (A|ab) at the ideal positions, and the
-        # moving auxiliary functions' potentials outside the fragment.
+        # Single entries, keyed by the moved atoms: (A|ab) at the ideal positions, the
+        # moving auxiliary functions' potentials outside the fragment, and their ideal
+        # metric rows.
         self.ideal_pairs = None
         self.outside_potentials = None
+        self.ideal_metric_rows = None
 
     def ideal_supercell(self, like):
         """``like`` (a supercell Cell) with every atom at its ideal position."""
@@ -708,19 +823,13 @@ class FragmentFit:
     def _moving_aux(self, cell, ideal, auxcell, dv):
         kfit = self.kfit
         nao = cell.nao_nr()
-        sl = auxcell.aoslice_by_atom()
-        xf = np.concatenate([np.arange(sl[i][2], sl[i][3]) for i in self.moved])
+        t0 = time.perf_counter()
+        xf, dj, djff = moving_metric(cell, ideal, auxcell, self.moved, kfit, self.settings)
+        self.moving_metric = (dj, djff)
+        self.timings["moved_aux_metric"] = time.perf_counter() - t0
         nx = len(xf)
-        new = [cell._atom[i] for i in self.moved]
         low = np.empty((2 * nx, nao * (nao + 1) // 2))
         low[:nx] = dv
-        t0 = time.perf_counter()
-        j2c = gamma_metric(cell, pbc_df.make_auxcell(
-            with_atoms(cell, new + list(ideal._atom)), kfit.auxbasis), self.settings)
-        dj = j2c[:nx, nx:] - j2c[nx + xf, nx:]
-        djff = j2c[:nx, :nx] - j2c[np.ix_(nx + xf, nx + xf)]
-        del j2c
-        self.timings["moved_aux_metric"] = time.perf_counter() - t0
         t0 = time.perf_counter()
         ex = np.zeros((nx, kfit.nk * kfit.naux))
         ex[np.arange(nx), xf] = 1.0

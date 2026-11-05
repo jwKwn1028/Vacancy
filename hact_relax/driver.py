@@ -368,7 +368,7 @@ def run_configuration(
         "convergence_drms": float(args.convergence_drms),
         "convergence_dmax": float(args.convergence_dmax),
         "tmax": float(args.tmax),
-        "initial_hessian": str(getattr(args, "initial_hessian", "guess")),
+        "initial_hessian": str(getattr(args, "initial_hessian", "lindh")),
         "single_point": bool(args.single_point),
         "energy_only": bool(getattr(args, "energy_only", False)),
         "allow_unconverged_geometry": bool(args.allow_unconverged_geometry),
@@ -553,7 +553,7 @@ def run_one(
     # A restart hands geomeTRIC the saved Hessian; PySCF would overwrite a file: Hessian.
     restart_hessian = getattr(getattr(scanner, "restart", None), "hessian_file", None)
     if (restart_hessian is None and not args.single_point
-            and getattr(args, "initial_hessian", "guess") == "lindh"):
+            and getattr(args, "initial_hessian", "lindh") == "lindh"):
         restart_hessian = write_model_hessian(output_dir / "initial_hessian.txt", driver_mol,
                                               lattice_bohr, movable, args.fd_axis_indices)
         if hasattr(scanner, "hessian"):

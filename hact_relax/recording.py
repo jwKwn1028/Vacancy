@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import resource
 import threading
 import time
@@ -91,6 +92,59 @@ def resource_snapshot() -> dict[str, Any]:
     except OSError:
         pass
     return snapshot
+
+
+# The scanners' labels: "<prefix>-<call>-center" and "<prefix>-<call>-a<atom><axis><sign>".
+_CALL_REASON = re.compile(r"-(\d+)-(?:center|a\d+[xyz][+-])$")
+
+
+def gradient_call(reason: str) -> int | None:
+    """The gradient call an evaluation's reason names, or None."""
+    match = _CALL_REASON.search(str(reason))
+    return None if match is None else int(match.group(1))
+
+
+def _replace(path: Path, write) -> None:
+    """``write(handle)`` into a file beside ``path``, moved over it when complete."""
+    partial = path.with_name(path.name + ".partial")
+    try:
+        with partial.open("wb") as handle:
+            write(handle)
+        os.replace(partial, path)
+    finally:
+        if partial.exists():
+            partial.unlink()
+
+
+def bath_spectrum_arrays(report: dict[str, Any]) -> dict[str, np.ndarray]:
+    """A bath_spectra.json report as arrays, one row per geometry: singular_values padded
+    with NaN to the longest spectrum, NaN for absent values and -1 for absent indices."""
+    g = report["geometries"]
+
+    def floats(key):
+        return np.array([np.nan if x.get(key) is None else x[key] for x in g], dtype=float)
+
+    def ints(key):
+        return np.array([-1 if x.get(key) is None else x[key] for x in g], dtype=int)
+
+    width = max((len(x["singular_values"]) for x in g), default=0)
+    singular = np.full((len(g), width), np.nan)
+    for row, x in zip(singular, g):
+        row[:len(x["singular_values"])] = x["singular_values"]
+    return {
+        "call": ints("call"), "evaluation": ints("evaluation"),
+        "reason": np.array([str(x["reason"]) for x in g], dtype=str),
+        "accept_center": np.array([bool(x["accept_center"]) for x in g], dtype=bool),
+        "relax_active": np.array([bool(x["relax_active"]) for x in g], dtype=bool),
+        "displaced_atom": ints("displaced_atom"), "n_bath": ints("n_bath"),
+        "singular_values": singular, "kept_min": floats("kept_min"),
+        "dropped_max": floats("dropped_max"), "cut_ratio": floats("cut_ratio"),
+        "pristine_energy_hartree": floats("pristine_energy_hartree"),
+        "pristine_converged": np.array([bool(x["pristine_converged"]) for x in g],
+                                       dtype=bool),
+        "bath_tol": np.array(np.nan if report.get("bath_tol") is None
+                             else report["bath_tol"], dtype=float),
+    }
 
 
 class JsonlWriter:
@@ -205,6 +259,9 @@ class RunRecorder:
         self.pristine_chkfile = self.output_dir / "pristine.chk"
         self.hact_chkfile = self.output_dir / "hact.chk"
         self.hact_input_chkfile = self.output_dir / "hact_input.chk"
+        self.bath_spectra_json = self.output_dir / "bath_spectra.json"
+        self.bath_spectra_npz = self.output_dir / "bath_spectra.npz"
+        self._bath_spectra: list[dict[str, Any]] = []
 
         self._evaluations = JsonlWriter(self.evaluations_path)
         self._scf_iterations = JsonlWriter(self.scf_iterations_path)
@@ -255,6 +312,17 @@ class RunRecorder:
             {"event": "scf_iteration", **row, **resource_snapshot()}
         )
 
+    def bath_spectrum(self, row: dict[str, Any]) -> None:
+        """One geometry's bath singular values.  bath_spectra.json and bath_spectra.npz
+        (tools/bath_spectrum_ladder.py's layout) are rewritten with every geometry so far."""
+        self._bath_spectra.append(dict(row))
+        report = {"run": os.fspath(self.output_dir), "bath_tol": self.config.get("bath_tol"),
+                  "geometries": self._bath_spectra}
+        text = json.dumps(report, indent=1, default=jsonable).encode()
+        _replace(self.bath_spectra_json, lambda handle: handle.write(text))
+        arrays = bath_spectrum_arrays(report)
+        _replace(self.bath_spectra_npz, lambda handle: np.savez(handle, **arrays))
+
     def phase(self, name: str) -> None:
         self.profiler.phase(name)
 
@@ -292,6 +360,9 @@ class NullRecorder:
         return None
 
     def scf_iteration(self, row: dict[str, Any]) -> None:
+        return None
+
+    def bath_spectrum(self, row: dict[str, Any]) -> None:
         return None
 
     def phase(self, name: str) -> None:

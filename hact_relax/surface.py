@@ -34,7 +34,7 @@ from hact_relax.errors import (
     SubspaceContinuityError,
 )
 from hact_relax.geometry import ghost_species, ideal_supercell, restored_pristine_atoms
-from hact_relax.recording import NullRecorder
+from hact_relax.recording import NullRecorder, gradient_call
 from hact_relax.symmetry import (
     active_representation,
     rotation_group,
@@ -902,6 +902,27 @@ class ActiveHamiltonianSurface:
                     spin=self.case.spin, **common
                 )
         record.update(self._embedding_record(solver))
+        # Before the H_act^V SCF and the guards, so a failing geometry keeps its spectrum.
+        singular = getattr(solver, "bath_singular_values", None)
+        self.recorder.bath_spectrum({
+            "call": gradient_call(reason),
+            "evaluation": evaluation,
+            "reason": reason,
+            "key": key,
+            "accept_center": bool(accept_center),
+            "relax_active": bool(relax_active),
+            "displaced_atom": record["displaced_atom"],
+            "pristine_energy_hartree": record["pristine_energy_hartree"],
+            "pristine_converged": record["pristine_scf_converged"],
+            "pristine_floor": floor,
+            "fragment_atoms": record["fragment_atoms"],
+            "n_bath": record["n_entangled_bath"],
+            "kept_min": record["bath_singular_value_kept_min"],
+            "dropped_max": record["bath_singular_value_dropped_max"],
+            "cut_ratio": record["bath_cut_ratio"],
+            "singular_values": ([] if singular is None
+                                else np.asarray(singular, dtype=float).tolist()),
+        })
 
         if solver.scell.natm != len(self.labels):
             raise RuntimeError(

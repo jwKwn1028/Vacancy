@@ -117,8 +117,9 @@ def _replace(path: Path, write) -> None:
 
 
 def bath_spectrum_arrays(report: dict[str, Any]) -> dict[str, np.ndarray]:
-    """A bath_spectra.json report as arrays, one row per geometry: singular_values padded
-    with NaN to the longest spectrum, NaN for absent values and -1 for absent indices."""
+    """A bath_spectra.json report as arrays, one row per geometry: singular_values and
+    fragment_occupations padded with NaN to the longest, NaN for absent values and -1 for
+    absent indices."""
     g = report["geometries"]
 
     def floats(key):
@@ -127,17 +128,22 @@ def bath_spectrum_arrays(report: dict[str, Any]) -> dict[str, np.ndarray]:
     def ints(key):
         return np.array([-1 if x.get(key) is None else x[key] for x in g], dtype=int)
 
-    width = max((len(x["singular_values"]) for x in g), default=0)
-    singular = np.full((len(g), width), np.nan)
-    for row, x in zip(singular, g):
-        row[:len(x["singular_values"])] = x["singular_values"]
+    def padded(key):
+        values = [x.get(key) or [] for x in g]
+        out = np.full((len(g), max(map(len, values), default=0)), np.nan)
+        for row, v in zip(out, values):
+            row[:len(v)] = v
+        return out
+
     return {
         "call": ints("call"), "evaluation": ints("evaluation"),
         "reason": np.array([str(x["reason"]) for x in g], dtype=str),
         "accept_center": np.array([bool(x["accept_center"]) for x in g], dtype=bool),
         "relax_active": np.array([bool(x["relax_active"]) for x in g], dtype=bool),
         "displaced_atom": ints("displaced_atom"), "n_bath": ints("n_bath"),
-        "singular_values": singular, "kept_min": floats("kept_min"),
+        "singular_values": padded("singular_values"),
+        "fragment_occupations": padded("fragment_occupations"),
+        "kept_min": floats("kept_min"),
         "dropped_max": floats("dropped_max"), "cut_ratio": floats("cut_ratio"),
         "pristine_energy_hartree": floats("pristine_energy_hartree"),
         "pristine_converged": np.array([bool(x["pristine_converged"]) for x in g],
@@ -145,6 +151,25 @@ def bath_spectrum_arrays(report: dict[str, Any]) -> dict[str, np.ndarray]:
         "bath_tol": np.array(np.nan if report.get("bath_tol") is None
                              else report["bath_tol"], dtype=float),
     }
+
+
+def append_fragment_orbitals(path: Path, row: dict[str, Any], cell=None) -> None:
+    """One geometry's fragment natural orbitals as group evaluation_<n> of an HDF5 file:
+    strings and integers as attributes, arrays as datasets.  ``cell`` (the host cell, as
+    Cell.dumps()) is stored once, as dataset 'cell', for cross-geometry overlaps."""
+    import h5py
+
+    with h5py.File(path, "a") as handle:
+        if cell is not None and "cell" not in handle:
+            handle["cell"] = cell
+        group = handle.create_group("evaluation_%06d" % int(row["evaluation"]))
+        for name, value in row.items():
+            if value is None:
+                continue
+            if isinstance(value, (str, int, np.integer)):
+                group.attrs[name] = value
+            else:
+                group[name] = np.asarray(value)
 
 
 class JsonlWriter:
@@ -261,7 +286,9 @@ class RunRecorder:
         self.hact_input_chkfile = self.output_dir / "hact_input.chk"
         self.bath_spectra_json = self.output_dir / "bath_spectra.json"
         self.bath_spectra_npz = self.output_dir / "bath_spectra.npz"
+        self.fragment_orbitals_path = self.output_dir / "fragment_orbitals.h5"
         self._bath_spectra: list[dict[str, Any]] = []
+        self._orbital_cell_written = False
 
         self._evaluations = JsonlWriter(self.evaluations_path)
         self._scf_iterations = JsonlWriter(self.scf_iterations_path)
@@ -323,6 +350,13 @@ class RunRecorder:
         arrays = bath_spectrum_arrays(report)
         _replace(self.bath_spectra_npz, lambda handle: np.savez(handle, **arrays))
 
+    def fragment_orbitals(self, row: dict[str, Any], cell=None) -> None:
+        """An accepted centre's fragment natural orbitals, appended to fragment_orbitals.h5
+        (read by tools/natural_orbital_recording.py)."""
+        dump = None if cell is None or self._orbital_cell_written else cell.dumps()
+        append_fragment_orbitals(self.fragment_orbitals_path, row, dump)
+        self._orbital_cell_written |= dump is not None
+
     def phase(self, name: str) -> None:
         self.profiler.phase(name)
 
@@ -363,6 +397,9 @@ class NullRecorder:
         return None
 
     def bath_spectrum(self, row: dict[str, Any]) -> None:
+        return None
+
+    def fragment_orbitals(self, row: dict[str, Any], cell=None) -> None:
         return None
 
     def phase(self, name: str) -> None:

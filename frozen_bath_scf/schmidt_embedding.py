@@ -24,6 +24,18 @@ def _sq(x):
     return x[0] if x.ndim == 3 else x
 
 
+def fragment_natural_orbitals(gamma_lo, fragment_lo_indices):
+    """The host's fragment natural orbitals: eigenvectors w_i of its fragment density block
+    P_FF (orthonormal LO basis, P = gamma/2), with occupations n_i.  For a projector P the
+    Schmidt SVD's singular values are s_i = sqrt(n_i (1 - n_i)) and its fragment vectors are
+    the w_i, so the order here (descending s, then n) is the SVD's above s ~ 1e-8, where n
+    is still resolved.  Returns n (nF,) and w (nF, nF) in the fragment LOs."""
+    f = np.asarray(fragment_lo_indices)
+    n, w = np.linalg.eigh(0.5 * np.asarray(gamma_lo)[np.ix_(f, f)])
+    order = np.lexsort((n, -n * (1.0 - n)))
+    return n[order], w[:, order]
+
+
 class _SchmidtEmbedding:
 
     def _configure(self, kmf, kmesh, *, vac_species, n_frag, charge=0,
@@ -307,6 +319,7 @@ class _SchmidtEmbedding:
             )
         perm = np.concatenate([fidx, eidx])
         nF = len(fidx)
+        self.fragment_lo_indices = fidx
         g = gamma[np.ix_(perm, perm)]
 
         P = g / 2.0

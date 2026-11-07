@@ -20,6 +20,7 @@ from frozen_bath_scf.orbital_optimizer import (
 from frozen_bath_scf.schmidt_embedding import (
     SchmidtEmbeddedRHF,
     SchmidtEmbeddedROHF,
+    fragment_natural_orbitals,
 )
 from system.pristine import build_pristine_mean_field
 from system.shells import coordination_shells, nearest_atoms
@@ -52,6 +53,18 @@ from hact_relax.tracking import (
     transport_active_solution,
     transport_defect_orbital,
 )
+
+
+def fragment_orbital_row(solver, coords_bohr, **ids) -> dict[str, Any]:
+    """The embedding's fragment natural orbitals, from its LO density (no new integrals):
+    occupations, LO and AO coefficients, each fragment LO's atom, and the geometry."""
+    fidx = solver.fragment_lo_indices
+    n, w = fragment_natural_orbitals(solver.gamma_lo, fidx)
+    return {**ids, "coords_bohr": np.asarray(coords_bohr, dtype=float),
+            "fragment_atoms": np.asarray(sorted(solver.frag_atoms), dtype=int),
+            "lo_atoms": np.asarray(solver.lo_atom_ids)[fidx],
+            "singular_values": np.asarray(solver.bath_singular_values, dtype=float),
+            "occupations": n, "lo_coeff": w, "ao_coeff": solver.C_lo[:, fidx] @ w}
 
 
 # Open-shell weight spread over equivalent atoms above which a centre warns.
@@ -904,6 +917,8 @@ class ActiveHamiltonianSurface:
         record.update(self._embedding_record(solver))
         # Before the H_act^V SCF and the guards, so a failing geometry keeps its spectrum.
         singular = getattr(solver, "bath_singular_values", None)
+        orbitals = fragment_orbital_row(solver, coords_bohr, evaluation=evaluation,
+                                        call=gradient_call(reason), reason=reason)
         self.recorder.bath_spectrum({
             "call": gradient_call(reason),
             "evaluation": evaluation,
@@ -922,7 +937,10 @@ class ActiveHamiltonianSurface:
             "cut_ratio": record["bath_cut_ratio"],
             "singular_values": ([] if singular is None
                                 else np.asarray(singular, dtype=float).tolist()),
+            "fragment_occupations": orbitals["occupations"].tolist(),
         })
+        if accept_center:
+            self.recorder.fragment_orbitals(orbitals, cell=solver.scell)
 
         if solver.scell.natm != len(self.labels):
             raise RuntimeError(
